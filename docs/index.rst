@@ -28,7 +28,6 @@
 
 |fury| |ossrank| |downloads| |pre-commit|
 
-
 Welcome to Astronomer Cosmos! Whether you're an experienced data practitioner or just getting started, Cosmos makes it
 simple to manage and orchestrate your dbt workflows using `Apache Airflow® <https://airflow.apache.org/>`_, saving you
 time and effort. By automatically turning dbt workflows into Airflow DAGs, Cosmos allows you to focus on building
@@ -137,12 +136,24 @@ _______
 
 `Apache License 2.0 <https://github.com/astronomer/astronomer-cosmos/blob/main/LICENSE>`_
 
+
 Privacy Notice
 ______________
 
-This project follows `Astronomer's Privacy Policy <https://www.astronomer.io/privacy/>`_
+The application and this website collect telemetry to support the project's development. These can be disabled by the end-users.
+
+Read the `Privacy Notice <https://github.com/astronomer/astronomer-cosmos/blob/main/PRIVACY_NOTICE.rst>`_ to learn more about it.
+
 
 .. Tracking pixel for Scarf
 .. raw:: html
 
     <img referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=ac335a8b-a9f3-49e6-9e8e-a7ec614fb794" />
+
+
+Security Policy
+---------------
+
+Check the project's `Security Policy <https://github.com/astronomer/astronomer-cosmos/blob/main/SECURITY.rst>`_ to learn
+how to report security vulnerabilities in Astronomer Cosmos and how security issues reported to the Astronomer Cosmos
+security team are handled.

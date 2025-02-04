@@ -7,7 +7,7 @@ import pytest
 from airflow.models import DAG
 
 from cosmos.config import ExecutionConfig, ProfileConfig, ProjectConfig, RenderConfig
-from cosmos.constants import DbtResourceType, ExecutionMode, InvocationMode, LoadMode
+from cosmos.constants import DbtResourceType, ExecutionMode, InvocationMode, LoadMode, TestBehavior
 from cosmos.converter import DbtToAirflowConverter, validate_arguments, validate_initial_user_config
 from cosmos.dbt.graph import DbtGraph, DbtNode
 from cosmos.exceptions import CosmosValueError
@@ -16,6 +16,7 @@ from cosmos.profiles.postgres import PostgresUserPasswordProfileMapping
 SAMPLE_PROFILE_YML = Path(__file__).parent / "sample/profiles.yml"
 SAMPLE_DBT_PROJECT = Path(__file__).parent / "sample/"
 SAMPLE_DBT_MANIFEST = Path(__file__).parent / "sample/manifest.json"
+MULTIPLE_PARENTS_TEST_DBT_PROJECT = Path(__file__).parent.parent / "dev/dags/dbt/multiple_parents_test/"
 
 
 @pytest.mark.parametrize("argument_key", ["tags", "paths"])
@@ -134,7 +135,7 @@ nodes = {"seed_parent": parent_seed}
     "execution_mode,operator_args",
     [
         (ExecutionMode.KUBERNETES, {}),
-        # (ExecutionMode.DOCKER, {"image": "sample-image"}),
+        (ExecutionMode.DOCKER, {"image": "sample-image"}),
     ],
 )
 @patch("cosmos.converter.DbtGraph.filtered_nodes", nodes)
@@ -164,10 +165,228 @@ def test_converter_creates_dag_with_seed(mock_load_dbt_graph, execution_mode, op
     assert converter
 
 
+@pytest.mark.integration
+def test_converter_creates_dag_with_test_with_multiple_parents():
+    """
+    Validate topology of a project that uses the MULTIPLE_PARENTS_TEST_DBT_PROJECT project
+    """
+    project_config = ProjectConfig(dbt_project_path=MULTIPLE_PARENTS_TEST_DBT_PROJECT)
+    execution_config = ExecutionConfig(execution_mode=ExecutionMode.LOCAL)
+    render_config = RenderConfig(should_detach_multiple_parents_tests=True)
+    profile_config = ProfileConfig(
+        profile_name="default",
+        target_name="dev",
+        profile_mapping=PostgresUserPasswordProfileMapping(
+            conn_id="example_conn",
+            profile_args={"schema": "public"},
+            disable_event_tracking=True,
+        ),
+    )
+    with DAG("sample_dag", start_date=datetime(2024, 4, 16)) as dag:
+        converter = DbtToAirflowConverter(
+            dag=dag,
+            project_config=project_config,
+            profile_config=profile_config,
+            execution_config=execution_config,
+            render_config=render_config,
+        )
+    tasks = converter.tasks_map
+
+    assert len(converter.tasks_map) == 4
+
+    # We exclude the test that depends on combined_model and model_a from their commands
+    args = tasks["model.my_dbt_project.combined_model"].children["combined_model.test"].build_cmd({})[0]
+    assert args[1:] == ["test", "--exclude", "custom_test_combined_model_combined_model_", "--models", "combined_model"]
+
+    args = tasks["model.my_dbt_project.model_a"].children["model_a.test"].build_cmd({})[0]
+    assert args[1:] == ["test", "--exclude", "custom_test_combined_model_combined_model_", "--models", "model_a"]
+
+    # The test for model_b should not be changed, since it is not a parent of this test
+    args = tasks["model.my_dbt_project.model_b"].children["model_b.test"].build_cmd({})[0]
+    assert args[1:] == ["test", "--models", "model_b"]
+
+    # We should have a task dedicated to run the test with multiple parents
+    args = tasks["test.my_dbt_project.custom_test_combined_model_combined_model_.c6e4587380"].build_cmd({})[0]
+    assert args[1:] == ["test", "--select", "custom_test_combined_model_combined_model_.c6e4587380"]
+    assert (
+        tasks["test.my_dbt_project.custom_test_combined_model_combined_model_.c6e4587380"].task_id
+        == "custom_test_combined_model_combined_model__test"
+    )
+
+
+@pytest.mark.integration
+def test_converter_creates_dag_with_test_with_multiple_parents_with_should_detach_multiple_parents_tests_false():
+    """
+    Validate topology of a project that uses the MULTIPLE_PARENTS_TEST_DBT_PROJECT project
+    """
+    project_config = ProjectConfig(dbt_project_path=MULTIPLE_PARENTS_TEST_DBT_PROJECT)
+    execution_config = ExecutionConfig(execution_mode=ExecutionMode.LOCAL)
+    render_config = RenderConfig(should_detach_multiple_parents_tests=False)
+    profile_config = ProfileConfig(
+        profile_name="default",
+        target_name="dev",
+        profile_mapping=PostgresUserPasswordProfileMapping(
+            conn_id="example_conn",
+            profile_args={"schema": "public"},
+            disable_event_tracking=True,
+        ),
+    )
+    with DAG("sample_dag", start_date=datetime(2024, 4, 16)) as dag:
+        converter = DbtToAirflowConverter(
+            dag=dag,
+            project_config=project_config,
+            profile_config=profile_config,
+            execution_config=execution_config,
+            render_config=render_config,
+        )
+    tasks = converter.tasks_map
+
+    assert len(converter.tasks_map) == 3
+
+    # We exclude the test that depends on combined_model and model_a from their commands
+    args = tasks["model.my_dbt_project.combined_model"].children["combined_model.test"].build_cmd({})[0]
+    assert args[1:] == ["test", "--models", "combined_model"]
+
+    args = tasks["model.my_dbt_project.model_a"].children["model_a.test"].build_cmd({})[0]
+    assert args[1:] == ["test", "--models", "model_a"]
+
+    # The test for model_b should not be changed, since it is not a parent of this test
+    args = tasks["model.my_dbt_project.model_b"].children["model_b.test"].build_cmd({})[0]
+    assert args[1:] == ["test", "--models", "model_b"]
+
+
+@pytest.mark.integration
+def test_converter_creates_dag_with_test_with_multiple_parents_test_afterall():
+    """
+    Validate topology of a project that uses the MULTIPLE_PARENTS_TEST_DBT_PROJECT project
+    """
+    project_config = ProjectConfig(dbt_project_path=MULTIPLE_PARENTS_TEST_DBT_PROJECT)
+    execution_config = ExecutionConfig(execution_mode=ExecutionMode.LOCAL)
+    render_config = RenderConfig(test_behavior=TestBehavior.AFTER_ALL, should_detach_multiple_parents_tests=True)
+    profile_config = ProfileConfig(
+        profile_name="default",
+        target_name="dev",
+        profile_mapping=PostgresUserPasswordProfileMapping(
+            conn_id="example_conn",
+            profile_args={"schema": "public"},
+            disable_event_tracking=True,
+        ),
+    )
+    with DAG("sample_dag", start_date=datetime(2024, 4, 16)) as dag:
+        converter = DbtToAirflowConverter(
+            dag=dag,
+            project_config=project_config,
+            profile_config=profile_config,
+            execution_config=execution_config,
+            render_config=render_config,
+        )
+    tasks = converter.tasks_map
+
+    assert len(converter.tasks_map) == 3
+
+    assert tasks["model.my_dbt_project.combined_model"].task_id == "combined_model_run"
+    assert tasks["model.my_dbt_project.model_a"].task_id == "model_a_run"
+    assert tasks["model.my_dbt_project.model_b"].task_id == "model_b_run"
+    assert tasks["model.my_dbt_project.combined_model"].downstream_task_ids == {"multiple_parents_test_test"}
+    assert tasks["model.my_dbt_project.model_a"].downstream_task_ids == {"combined_model_run"}
+    assert tasks["model.my_dbt_project.model_b"].downstream_task_ids == {"combined_model_run"}
+    multiple_parents_test_test_args = tasks["model.my_dbt_project.combined_model"].downstream_list[0].build_cmd({})[0]
+    assert multiple_parents_test_test_args[1:] == ["test"]
+
+
+@pytest.mark.integration
+def test_converter_creates_dag_with_test_with_multiple_parents_test_none():
+    """
+    Validate topology of a project that uses the MULTIPLE_PARENTS_TEST_DBT_PROJECT project
+    """
+    project_config = ProjectConfig(dbt_project_path=MULTIPLE_PARENTS_TEST_DBT_PROJECT)
+    execution_config = ExecutionConfig(execution_mode=ExecutionMode.LOCAL)
+    render_config = RenderConfig(test_behavior=TestBehavior.NONE, should_detach_multiple_parents_tests=True)
+    profile_config = ProfileConfig(
+        profile_name="default",
+        target_name="dev",
+        profile_mapping=PostgresUserPasswordProfileMapping(
+            conn_id="example_conn",
+            profile_args={"schema": "public"},
+            disable_event_tracking=True,
+        ),
+    )
+    with DAG("sample_dag", start_date=datetime(2024, 4, 16)) as dag:
+        converter = DbtToAirflowConverter(
+            dag=dag,
+            project_config=project_config,
+            profile_config=profile_config,
+            execution_config=execution_config,
+            render_config=render_config,
+        )
+    tasks = converter.tasks_map
+
+    assert len(converter.tasks_map) == 3
+
+    assert tasks["model.my_dbt_project.combined_model"].task_id == "combined_model_run"
+    assert tasks["model.my_dbt_project.model_a"].task_id == "model_a_run"
+    assert tasks["model.my_dbt_project.model_b"].task_id == "model_b_run"
+    assert tasks["model.my_dbt_project.combined_model"].downstream_task_ids == set()
+    assert tasks["model.my_dbt_project.model_b"].downstream_task_ids == {"combined_model_run"}
+    assert tasks["model.my_dbt_project.model_b"].downstream_task_ids == {"combined_model_run"}
+
+
+@pytest.mark.integration
+def test_converter_creates_dag_with_test_with_multiple_parents_and_build():
+    """
+    Validate topology of a project that uses the MULTIPLE_PARENTS_TEST_DBT_PROJECT project and uses TestBehavior.BUILD
+    """
+    project_config = ProjectConfig(dbt_project_path=MULTIPLE_PARENTS_TEST_DBT_PROJECT)
+    execution_config = ExecutionConfig(execution_mode=ExecutionMode.LOCAL)
+    render_config = RenderConfig(test_behavior=TestBehavior.BUILD, should_detach_multiple_parents_tests=True)
+    profile_config = ProfileConfig(
+        profile_name="default",
+        target_name="dev",
+        profile_mapping=PostgresUserPasswordProfileMapping(
+            conn_id="example_conn",
+            profile_args={"schema": "public"},
+            disable_event_tracking=True,
+        ),
+    )
+    with DAG("sample_dag", start_date=datetime(2024, 4, 16)) as dag:
+        converter = DbtToAirflowConverter(
+            dag=dag,
+            project_config=project_config,
+            profile_config=profile_config,
+            execution_config=execution_config,
+            render_config=render_config,
+        )
+    tasks = converter.tasks_map
+
+    assert len(converter.tasks_map) == 4
+
+    # We exclude the test that depends on combined_model and model_a from their commands
+    args = tasks["model.my_dbt_project.combined_model"].build_cmd({})[0]
+    assert args[1:] == [
+        "build",
+        "--exclude",
+        "custom_test_combined_model_combined_model_",
+        "--models",
+        "combined_model",
+    ]
+
+    args = tasks["model.my_dbt_project.model_a"].build_cmd({})[0]
+    assert args[1:] == ["build", "--exclude", "custom_test_combined_model_combined_model_", "--models", "model_a"]
+
+    # The test for model_b should not be changed, since it is not a parent of this test
+    args = tasks["model.my_dbt_project.model_b"].build_cmd({})[0]
+    assert args[1:] == ["build", "--models", "model_b"]
+
+    # We should have a task dedicated to run the test with multiple parents
+    args = tasks["test.my_dbt_project.custom_test_combined_model_combined_model_.c6e4587380"].build_cmd({})[0]
+    assert args[1:] == ["test", "--select", "custom_test_combined_model_combined_model_.c6e4587380"]
+
+
 @pytest.mark.parametrize(
     "execution_mode,operator_args",
     [
         (ExecutionMode.KUBERNETES, {}),
+        (ExecutionMode.DOCKER, {"image": "sample-image"}),
     ],
 )
 @patch("cosmos.converter.DbtGraph.filtered_nodes", nodes)
@@ -201,7 +420,7 @@ def test_converter_creates_dag_with_project_path_str(mock_load_dbt_graph, execut
     "execution_mode,virtualenv_dir,operator_args",
     [
         (ExecutionMode.KUBERNETES, Path("/some/virtualenv/dir"), {}),
-        # (ExecutionMode.DOCKER, {"image": "sample-image"}),
+        (ExecutionMode.DOCKER, Path("/some/virtualenv/dir"), {"image": "sample-image"}),
     ],
 )
 @patch("cosmos.converter.DbtGraph.filtered_nodes", nodes)
@@ -241,7 +460,7 @@ def test_converter_raises_warning(mock_load_dbt_graph, execution_mode, virtualen
     "execution_mode,operator_args",
     [
         (ExecutionMode.KUBERNETES, {}),
-        # (ExecutionMode.DOCKER, {"image": "sample-image"}),
+        (ExecutionMode.DOCKER, {"image": "sample-image"}),
     ],
 )
 @patch("cosmos.converter.DbtGraph.filtered_nodes", nodes)
@@ -278,7 +497,7 @@ def test_converter_fails_execution_config_no_project_dir(mock_load_dbt_graph, ex
     "execution_mode,operator_args",
     [
         (ExecutionMode.KUBERNETES, {}),
-        # (ExecutionMode.DOCKER, {"image": "sample-image"}),
+        (ExecutionMode.DOCKER, {"image": "sample-image"}),
     ],
 )
 @patch("cosmos.converter.DbtGraph.filtered_nodes", nodes)
@@ -317,7 +536,7 @@ def test_converter_fails_project_config_path_and_execution_config_path(
     "execution_mode,operator_args",
     [
         (ExecutionMode.KUBERNETES, {}),
-        # (ExecutionMode.DOCKER, {"image": "sample-image"}),
+        (ExecutionMode.DOCKER, {"image": "sample-image"}),
     ],
 )
 @patch("cosmos.converter.DbtGraph.filtered_nodes", nodes)
@@ -578,3 +797,35 @@ def test_converter_contains_dbt_graph(mock_load_dbt_graph, execution_mode, opera
         operator_args=operator_args,
     )
     assert isinstance(converter.dbt_graph, DbtGraph)
+
+
+@pytest.mark.parametrize(
+    "execution_mode,operator_args",
+    [
+        (ExecutionMode.KUBERNETES, {}),
+    ],
+)
+@patch("cosmos.converter.DbtGraph.filtered_nodes", nodes)
+@patch("cosmos.converter.DbtGraph.load")
+def test_converter_contains_tasks_map(mock_load_dbt_graph, execution_mode, operator_args):
+    """
+    This test validates that DbtToAirflowConverter contains and exposes a tasks map instance
+    """
+    project_config = ProjectConfig(dbt_project_path=SAMPLE_DBT_PROJECT)
+    execution_config = ExecutionConfig(execution_mode=execution_mode)
+    render_config = RenderConfig(emit_datasets=True)
+    profile_config = ProfileConfig(
+        profile_name="my_profile_name",
+        target_name="my_target_name",
+        profiles_yml_filepath=SAMPLE_PROFILE_YML,
+    )
+    converter = DbtToAirflowConverter(
+        dag=DAG("sample_dag", start_date=datetime(2024, 1, 1)),
+        nodes=nodes,
+        project_config=project_config,
+        profile_config=profile_config,
+        execution_config=execution_config,
+        render_config=render_config,
+        operator_args=operator_args,
+    )
+    assert isinstance(converter.tasks_map, dict)

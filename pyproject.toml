@@ -31,12 +31,12 @@ dependencies = [
     "aenum",
     "attrs",
     "apache-airflow>=2.4.0",
+    "deprecation",  # Python 3.13 exposes a deprecated operator, we can remove this dependency in the future
     "importlib-metadata; python_version < '3.8'",
     "Jinja2>=3.0.0",
     "msgpack",
     "packaging>=22.0",
     "pydantic>=1.10.0",
-    "typing-extensions; python_version < '3.8'",
     "virtualenv",
 ]
 
@@ -45,8 +45,12 @@ dbt-all = [
     "dbt-athena",
     "dbt-bigquery",
     "dbt-clickhouse",
-    "dbt-databricks",
+    # The dbt-databricks:1.9.0 version causes a dependency conflict with
+    # the Pydantic version required by Airflow (version > 2.7)
+    # See: https://github.com/astronomer/astronomer-cosmos/issues/1379
+    "dbt-databricks!=1.9.0",
     "dbt-exasol",
+    "dbt-oracle",
     "dbt-postgres",
     "dbt-redshift",
     "dbt-snowflake",
@@ -59,6 +63,7 @@ dbt-bigquery = ["dbt-bigquery"]
 dbt-clickhouse = ["dbt-clickhouse"]
 dbt-databricks = ["dbt-databricks"]
 dbt-exasol = ["dbt-exasol"]
+dbt-oracle = ["dbt-oracle"]
 dbt-postgres = ["dbt-postgres"]
 dbt-redshift = ["dbt-redshift"]
 dbt-snowflake = ["dbt-snowflake"]
@@ -69,8 +74,8 @@ openlineage = ["openlineage-integration-common!=1.15.0", "openlineage-airflow"]
 amazon = [
     "apache-airflow-providers-amazon[s3fs]>=3.0.0",
 ]
-google = ["apache-airflow-providers-google"]
-microsoft = ["apache-airflow-providers-microsoft-azure"]
+google = ["apache-airflow-providers-google>=10.17.0"]
+microsoft = ["apache-airflow-providers-microsoft-azure>=8.5.0"]
 all = [
     "astronomer-cosmos[dbt-all]",
     "astronomer-cosmos[openlineage]",
@@ -95,7 +100,7 @@ aws_eks = [
     "apache-airflow-providers-amazon>=8.0.0",
 ]
 azure-container-instance = [
-    "apache-airflow-providers-microsoft-azure>=8.4.0",
+    "apache-airflow-providers-microsoft-azure>=8.5.0",
 ]
 gcp-cloud-run-job = [
     "apache-airflow-providers-google>=10.11.0",
@@ -144,6 +149,7 @@ dependencies = [
     "types-requests",
     "types-python-dateutil",
     "Werkzeug<3.0.0",
+    "dbt-core",
 ]
 pre-install-commands = ["sh scripts/test/pre-install-airflow.sh {matrix:airflow} {matrix:python}"]
 
@@ -166,16 +172,15 @@ test-kubernetes-setup = "sh scripts/test/kubernetes-setup.sh"
 test-integration-dbt-1-5-4 = 'sh scripts/test/integration-dbt-1-5-4.sh'
 test-integration-expensive = 'sh scripts/test/integration-expensive.sh'
 test-integration-setup = 'sh scripts/test/integration-setup.sh'
-test-integration-sqlite = 'sh scripts/test/integration-sqlite.sh'
-test-integration-sqlite-setup = 'sh scripts/test/integration-sqlite-setup.sh'
 test-performance = 'sh scripts/test/performance.sh'
 test-performance-setup = 'sh scripts/test/performance-setup.sh'
 type-check = "pre-commit run mypy --files cosmos/**/*"
 
 [tool.pytest.ini_options]
+addopts = "--ignore-glob=**/dbt_packages/*"
 filterwarnings = ["ignore::DeprecationWarning"]
 minversion = "6.0"
-markers = ["integration", "sqlite", "perf"]
+markers = ["integration", "perf"]
 
 ######################################
 # DOCS
@@ -184,13 +189,9 @@ markers = ["integration", "sqlite", "perf"]
 [tool.hatch.envs.docs]
 dependencies = [
     "aenum",
-    "apache-airflow-providers-amazon[s3fs]>=3.0.0",
-    "apache-airflow-providers-cncf-kubernetes>=5.1.1",
-    "apache-airflow-providers-google>=10.11.0",
-    "apache-airflow-providers-microsoft-azure",
     "msgpack",
-    "openlineage-airflow",
-    "pydantic>=1.10.0",
+    "apache-airflow",
+    "pydantic",
     "pydata-sphinx-theme",
     "sphinx",
     "sphinx-autoapi",

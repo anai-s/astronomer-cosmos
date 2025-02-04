@@ -20,7 +20,8 @@ PATH_SELECTOR = "path:"
 TAG_SELECTOR = "tag:"
 CONFIG_SELECTOR = "config."
 PLUS_SELECTOR = "+"
-GRAPH_SELECTOR_REGEX = r"^([0-9]*\+)?([^\+]+)(\+[0-9]*)?$|"
+AT_SELECTOR = "@"
+GRAPH_SELECTOR_REGEX = r"^(@|[0-9]*\+)?([^\+]+)(\+[0-9]*)?$|"
 
 logger = get_logger(__name__)
 
@@ -35,6 +36,7 @@ class GraphSelector:
         +model_d+
         2+model_e
         model_f+3
+        @model_g
         +/path/to/model_g+
         path:/path/to/model_h+
         +tag:nightly
@@ -46,6 +48,7 @@ class GraphSelector:
     node_name: str
     precursors: str | None
     descendants: str | None
+    at_operator: bool = False
 
     @property
     def precursors_depth(self) -> int:
@@ -56,6 +59,8 @@ class GraphSelector:
             0: if it shouldn't return any precursors
             >0: upperbound number of parent generations
         """
+        if self.at_operator:
+            return -1
         if not self.precursors:
             return 0
         if self.precursors == "+":
@@ -90,7 +95,13 @@ class GraphSelector:
             precursors, node_name, descendants = regex_match.groups()
             if "/" in node_name and not node_name.startswith(PATH_SELECTOR):
                 node_name = f"{PATH_SELECTOR}{node_name}"
-            return GraphSelector(node_name, precursors, descendants)
+
+            at_operator = precursors == AT_SELECTOR
+            if at_operator:
+                precursors = None
+                descendants = "+"  # @ implies all descendants
+
+            return GraphSelector(node_name, precursors, descendants, at_operator)
         return None
 
     def select_node_precursors(self, nodes: dict[str, DbtNode], root_id: str, selected_nodes: set[str]) -> None:
@@ -101,7 +112,7 @@ class GraphSelector:
         :param root_id: Unique identifier of self.node_name
         :param selected_nodes: Set where precursor nodes will be added to.
         """
-        if self.precursors:
+        if self.precursors or self.at_operator:
             depth = self.precursors_depth
             previous_generation = {root_id}
             processed_nodes = set()
@@ -155,7 +166,6 @@ class GraphSelector:
         """
         selected_nodes: set[str] = set()
         root_nodes: set[str] = set()
-
         # Index nodes by name, we can improve performance by doing this once
         # for multiple GraphSelectors
         if PATH_SELECTOR in self.node_name:
@@ -199,19 +209,44 @@ class GraphSelector:
             for node_id, node in nodes.items():
                 node_by_name[node.name] = node_id
 
-            if self.node_name in node_by_name:
-                root_id = node_by_name[self.node_name]
+            node_name_patched = self.node_name.replace(".", "_")
+
+            if node_name_patched in node_by_name:
+                root_id = node_by_name[node_name_patched]
                 root_nodes.add(root_id)
             else:
-                logger.warn(f"Selector {self.node_name} not found.")
+                logger.warning(f"Selector {self.node_name} not found.")
                 return selected_nodes
 
         selected_nodes.update(root_nodes)
 
-        for root_id in root_nodes:
-            self.select_node_precursors(nodes, root_id, selected_nodes)
-            self.select_node_descendants(nodes, root_id, selected_nodes)
+        self._select_nodes(nodes, root_nodes, selected_nodes)
+
         return selected_nodes
+
+    def _select_nodes(self, nodes: dict[str, DbtNode], root_nodes: set[str], selected_nodes: set[str]) -> None:
+        """
+        Handle selection of nodes based on the graph selector configuration.
+
+        :param nodes: dbt project nodes
+        :param root_nodes: Set of root node ids
+        :param selected_nodes: Set where selected nodes will be added to.
+        """
+        if self.at_operator:
+            descendants: set[str] = set()
+            # First get all descendants
+            for root_id in root_nodes:
+                self.select_node_descendants(nodes, root_id, descendants)
+            selected_nodes.update(descendants)
+
+            # Get ancestors for root nodes and all descendants
+            for node_id in root_nodes | descendants:
+                self.select_node_precursors(nodes, node_id, selected_nodes)
+        else:
+            # Normal selection
+            for root_id in root_nodes:
+                self.select_node_precursors(nodes, root_id, selected_nodes)
+                self.select_node_descendants(nodes, root_id, selected_nodes)
 
 
 class SelectorConfig:
@@ -333,25 +368,36 @@ class NodeSelector:
         selected_nodes: set[str] = set()
         self.visited_nodes: set[str] = set()
 
-        for node_id, node in self.nodes.items():
-            if self._should_include_node(node_id, node):
-                selected_nodes.add(node_id)
-
         if self.config.graph_selectors:
-            nodes_by_graph_selector = self.select_by_graph_operator()
-            selected_nodes = selected_nodes.intersection(nodes_by_graph_selector)
+            graph_selected_nodes = self.select_by_graph_operator()
+            for node_id in graph_selected_nodes:
+                node = self.nodes[node_id]
+                # Since the method below changes the tags of test nodes, it can lead to incorrect
+                # results during the application of graph selectors. Therefore, it is being run within
+                # nodes previously selected
+                # This solves https://github.com/astronomer/astronomer-cosmos/pull/1466
+                if self._should_include_node(node_id, node):
+                    selected_nodes.add(node_id)
+        else:
+            for node_id, node in self.nodes.items():
+                if self._should_include_node(node_id, node):
+                    selected_nodes.add(node_id)
 
         self.selected_nodes = selected_nodes
         return selected_nodes
 
     def _should_include_node(self, node_id: str, node: DbtNode) -> bool:
-        """Checks if a single node should be included. Only runs once per node with caching."""
+        """
+        Checks if a single node should be included. Only runs once per node with caching."""
         logger.debug("Inspecting if the node <%s> should be included.", node_id)
         if node_id in self.visited_nodes:
             return node_id in self.selected_nodes
 
         self.visited_nodes.add(node_id)
 
+        # Disclaimer: this method currently copies the tags from parent nodes to children nodes
+        # that are tests. This can lead to incorrect results in graph node selectors such as reported in
+        # https://github.com/astronomer/astronomer-cosmos/pull/1466
         if node.resource_type == DbtResourceType.TEST and node.depends_on and len(node.depends_on) > 0:
             node.tags = getattr(self.nodes.get(node.depends_on[0]), "tags", [])
             logger.debug(
@@ -464,7 +510,6 @@ def select_nodes(
     exclude = exclude or []
     if not select and not exclude:
         return nodes
-
     validate_filters(exclude, select)
     subset_ids = apply_select_filter(nodes, project_dir, select)
     if select:

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections import OrderedDict, defaultdict
+from copy import deepcopy
 from typing import Any, Callable, Union
 
 from airflow.models import BaseOperator
+from airflow.models.base import ID_LEN as AIRFLOW_MAX_ID_LENGTH
 from airflow.models.dag import DAG
 from airflow.utils.task_group import TaskGroup
 
@@ -10,6 +13,7 @@ from cosmos.config import RenderConfig
 from cosmos.constants import (
     DBT_COMPILE_TASK_ID,
     DEFAULT_DBT_RESOURCES,
+    SUPPORTED_BUILD_RESOURCES,
     TESTABLE_DBT_RESOURCES,
     DbtResourceType,
     ExecutionMode,
@@ -73,6 +77,42 @@ def calculate_leaves(tasks_ids: list[str], nodes: dict[str, DbtNode]) -> list[st
     return leaves
 
 
+def exclude_detached_tests_if_needed(
+    node: DbtNode,
+    task_args: dict[str, str],
+    detached_from_parent: dict[str, DbtNode] | None = None,
+) -> None:
+    """
+    Add exclude statements if there are tests associated to the model that should be run detached from the model/tests.
+
+    Change task_args in-place.
+    """
+    if detached_from_parent is None:
+        detached_from_parent = {}
+    exclude: list[str] = task_args.get("exclude", [])  # type: ignore
+    tests_detached_from_this_node: list[DbtNode] = detached_from_parent.get(node.unique_id, [])  # type: ignore
+    for test_node in tests_detached_from_this_node:
+        exclude.append(test_node.resource_name.split(".")[0])
+    if exclude:
+        task_args["exclude"] = exclude  # type: ignore
+
+
+def _override_profile_if_needed(task_kwargs: dict[str, Any], profile_kwargs_override: dict[str, Any]) -> None:
+    """
+    Changes in-place the profile configuration if it needs to be overridden.
+    """
+    if profile_kwargs_override:
+        modified_profile_config = deepcopy(task_kwargs["profile_config"])
+        modified_profile_kwargs_override = deepcopy(profile_kwargs_override)
+        profile_mapping_override = modified_profile_kwargs_override.pop("profile_mapping", {})
+        for key, value in modified_profile_kwargs_override.items():
+            setattr(modified_profile_config, key, value)
+        if modified_profile_config.profile_mapping and profile_mapping_override:
+            for key, value in profile_mapping_override.items():
+                setattr(modified_profile_config.profile_mapping, key, value)
+        task_kwargs["profile_config"] = modified_profile_config
+
+
 def create_test_task_metadata(
     test_task_name: str,
     execution_mode: ExecutionMode,
@@ -81,6 +121,7 @@ def create_test_task_metadata(
     on_warning_callback: Callable[..., Any] | None = None,
     node: DbtNode | None = None,
     render_config: RenderConfig | None = None,
+    detached_from_parent: dict[str, DbtNode] | None = None,
 ) -> TaskMetadata:
     """
     Create the metadata that will be used to instantiate the Airflow Task that will be used to run the Dbt test node.
@@ -91,13 +132,16 @@ def create_test_task_metadata(
     :param on_warning_callback: A callback function called on warnings with additional Context variables “test_names”
     and “test_results” of type List.
     :param node: If the test relates to a specific node, the node reference
+    :param detached_from_parent: Dictionary that maps node ids and their children tests that should be run detached
     :returns: The metadata necessary to instantiate the source dbt node as an Airflow task.
     """
     task_args = dict(task_args)
     task_args["on_warning_callback"] = on_warning_callback
     extra_context = {}
+    detached_from_parent = detached_from_parent or {}
 
     task_owner = ""
+
     if test_indirect_selection != TestIndirectSelection.EAGER:
         task_args["indirect_selection"] = test_indirect_selection.value
     if node is not None:
@@ -116,6 +160,14 @@ def create_test_task_metadata(
         task_args["selector"] = render_config.selector
         task_args["exclude"] = render_config.exclude
 
+    if node:
+        exclude_detached_tests_if_needed(node, task_args, detached_from_parent)
+        _override_profile_if_needed(task_args, node.profile_config_to_override)
+
+    args_to_override: dict[str, Any] = {}
+    if node:
+        args_to_override = node.operator_kwargs_to_override
+
     return TaskMetadata(
         id=test_task_name,
         owner=task_owner,
@@ -123,9 +175,59 @@ def create_test_task_metadata(
             execution_mode=execution_mode,
             dbt_class="DbtTest",
         ),
-        arguments=task_args,
+        arguments={**task_args, **args_to_override},
         extra_context=extra_context,
     )
+
+
+def _get_task_id_and_args(
+    node: DbtNode,
+    args: dict[str, Any],
+    use_task_group: bool,
+    normalize_task_id: Callable[..., Any] | None,
+    resource_suffix: str,
+    include_resource_type: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """
+    Generate task ID and update args with display name if needed.
+    """
+    args_update = args
+    task_display_name = f"{node.name}_{resource_suffix}"
+    if include_resource_type:
+        task_display_name = f"{node.name}_{node.resource_type.value}_{resource_suffix}"
+    if use_task_group:
+        task_id = resource_suffix
+    elif normalize_task_id:
+        task_id = normalize_task_id(node)
+        args_update["task_display_name"] = task_display_name
+    else:
+        task_id = task_display_name
+    return task_id, args_update
+
+
+def create_dbt_resource_to_class(test_behavior: TestBehavior) -> dict[str, str]:
+    """
+    Return the map from dbt node type to Cosmos class prefix that should be used
+    to handle them.
+    """
+
+    if test_behavior == TestBehavior.BUILD:
+        dbt_resource_to_class = {
+            DbtResourceType.MODEL: "DbtBuild",
+            DbtResourceType.SNAPSHOT: "DbtBuild",
+            DbtResourceType.SEED: "DbtBuild",
+            DbtResourceType.TEST: "DbtTest",
+            DbtResourceType.SOURCE: "DbtSource",
+        }
+    else:
+        dbt_resource_to_class = {
+            DbtResourceType.MODEL: "DbtRun",
+            DbtResourceType.SNAPSHOT: "DbtSnapshot",
+            DbtResourceType.SEED: "DbtSeed",
+            DbtResourceType.TEST: "DbtTest",
+            DbtResourceType.SOURCE: "DbtSource",
+        }
+    return dbt_resource_to_class
 
 
 def create_task_metadata(
@@ -135,6 +237,10 @@ def create_task_metadata(
     dbt_dag_task_group_identifier: str,
     use_task_group: bool = False,
     source_rendering_behavior: SourceRenderingBehavior = SourceRenderingBehavior.NONE,
+    normalize_task_id: Callable[..., Any] | None = None,
+    test_behavior: TestBehavior = TestBehavior.AFTER_ALL,
+    on_warning_callback: Callable[..., Any] | None = None,
+    detached_from_parent: dict[str, DbtNode] | None = None,
 ) -> TaskMetadata | None:
     """
     Create the metadata that will be used to instantiate the Airflow Task used to run the Dbt node.
@@ -146,47 +252,54 @@ def create_task_metadata(
     :param dbt_dag_task_group_identifier: Identifier to refer to the DbtDAG or DbtTaskGroup in the DAG.
     :param use_task_group: It determines whether to use the name as a prefix for the task id or not.
         If it is False, then use the name as a prefix for the task id, otherwise do not.
+    :param on_warning_callback: A callback function called on warnings with additional Context variables “test_names”
+        and “test_results” of type List. This is param available for dbt test and dbt source freshness command.
+    :param detached_from_parent: Dictionary that maps node ids and their children tests that should be run detached
     :returns: The metadata necessary to instantiate the source dbt node as an Airflow task.
     """
-    dbt_resource_to_class = {
-        DbtResourceType.MODEL: "DbtRun",
-        DbtResourceType.SNAPSHOT: "DbtSnapshot",
-        DbtResourceType.SEED: "DbtSeed",
-        DbtResourceType.TEST: "DbtTest",
-        DbtResourceType.SOURCE: "DbtSource",
-    }
+    dbt_resource_to_class = create_dbt_resource_to_class(test_behavior)
+
     args = {**args, **{"models": node.resource_name}}
 
     if DbtResourceType(node.resource_type) in DEFAULT_DBT_RESOURCES and node.resource_type in dbt_resource_to_class:
-        extra_context = {
+        extra_context: dict[str, Any] = {
             "dbt_node_config": node.context_dict,
             "dbt_dag_task_group_identifier": dbt_dag_task_group_identifier,
         }
-        if node.resource_type == DbtResourceType.MODEL:
-            task_id = f"{node.name}_run"
-            if use_task_group is True:
-                task_id = "run"
+
+        if test_behavior == TestBehavior.BUILD and node.resource_type in SUPPORTED_BUILD_RESOURCES:
+            exclude_detached_tests_if_needed(node, args, detached_from_parent)
+            task_id, args = _get_task_id_and_args(
+                node, args, use_task_group, normalize_task_id, "build", include_resource_type=True
+            )
+        elif node.resource_type == DbtResourceType.MODEL:
+            task_id, args = _get_task_id_and_args(node, args, use_task_group, normalize_task_id, "run")
         elif node.resource_type == DbtResourceType.SOURCE:
+            args["on_warning_callback"] = on_warning_callback
+
             if (source_rendering_behavior == SourceRenderingBehavior.NONE) or (
                 source_rendering_behavior == SourceRenderingBehavior.WITH_TESTS_OR_FRESHNESS
                 and node.has_freshness is False
                 and node.has_test is False
             ):
                 return None
-            # TODO: https://github.com/astronomer/astronomer-cosmos
-            # pragma: no cover
-            task_id = f"{node.name}_source"
             args["select"] = f"source:{node.resource_name}"
             args.pop("models")
-            if use_task_group is True:
-                task_id = node.resource_type.value
+            task_id, args = _get_task_id_and_args(node, args, use_task_group, normalize_task_id, "source")
             if node.has_freshness is False and source_rendering_behavior == SourceRenderingBehavior.ALL:
                 # render sources without freshness as empty operators
-                return TaskMetadata(id=task_id, operator_class="airflow.operators.empty.EmptyOperator")
+                # empty operator does not accept custom parameters (e.g., profile_args). recreate the args.
+                if "task_display_name" in args:
+                    args = {"task_display_name": args["task_display_name"]}
+                else:
+                    args = {}
+                return TaskMetadata(id=task_id, operator_class="airflow.operators.empty.EmptyOperator", arguments=args)
         else:
-            task_id = f"{node.name}_{node.resource_type.value}"
-            if use_task_group is True:
-                task_id = node.resource_type.value
+            task_id, args = _get_task_id_and_args(
+                node, args, use_task_group, normalize_task_id, node.resource_type.value
+            )
+
+        _override_profile_if_needed(args, node.profile_config_to_override)
 
         task_metadata = TaskMetadata(
             id=task_id,
@@ -194,7 +307,7 @@ def create_task_metadata(
             operator_class=calculate_operator_class(
                 execution_mode=execution_mode, dbt_class=dbt_resource_to_class[node.resource_type]
             ),
-            arguments=args,
+            arguments={**args, **node.operator_kwargs_to_override},
             extra_context=extra_context,
         )
         return task_metadata
@@ -207,6 +320,17 @@ def create_task_metadata(
         return None
 
 
+def is_detached_test(node: DbtNode) -> bool:
+    """
+    Identify if node should be rendered detached from the parent. Conditions that should be met:
+    * is a test
+    * has multiple parents
+    """
+    if node.resource_type == DbtResourceType.TEST and len(node.depends_on) > 1:
+        return True
+    return False
+
+
 def generate_task_or_group(
     dag: DAG,
     task_group: TaskGroup | None,
@@ -217,9 +341,12 @@ def generate_task_or_group(
     source_rendering_behavior: SourceRenderingBehavior,
     test_indirect_selection: TestIndirectSelection,
     on_warning_callback: Callable[..., Any] | None,
+    normalize_task_id: Callable[..., Any] | None = None,
+    detached_from_parent: dict[str, DbtNode] | None = None,
     **kwargs: Any,
 ) -> BaseOperator | TaskGroup | None:
     task_or_group: BaseOperator | TaskGroup | None = None
+    detached_from_parent = detached_from_parent or {}
 
     use_task_group = (
         node.resource_type in TESTABLE_DBT_RESOURCES
@@ -234,12 +361,16 @@ def generate_task_or_group(
         dbt_dag_task_group_identifier=_get_dbt_dag_task_group_identifier(dag, task_group),
         use_task_group=use_task_group,
         source_rendering_behavior=source_rendering_behavior,
+        normalize_task_id=normalize_task_id,
+        test_behavior=test_behavior,
+        on_warning_callback=on_warning_callback,
+        detached_from_parent=detached_from_parent,
     )
 
     # In most cases, we'll  map one DBT node to one Airflow task
     # The exception are the test nodes, since it would be too slow to run test tasks individually.
     # If test_behaviour=="after_each", each model task will be bundled with a test task, using TaskGroup
-    if task_meta and node.resource_type != DbtResourceType.TEST:
+    if task_meta and not node.resource_type == DbtResourceType.TEST:
         if use_task_group:
             with TaskGroup(dag=dag, group_id=node.name, parent_group=task_group) as model_task_group:
                 task = create_airflow_task(task_meta, dag, task_group=model_task_group)
@@ -250,12 +381,14 @@ def generate_task_or_group(
                     task_args=task_args,
                     node=node,
                     on_warning_callback=on_warning_callback,
+                    detached_from_parent=detached_from_parent,
                 )
                 test_task = create_airflow_task(test_meta, dag, task_group=model_task_group)
                 task >> test_task
                 task_or_group = model_task_group
         else:
             task_or_group = create_airflow_task(task_meta, dag, task_group=task_group)
+
     return task_or_group
 
 
@@ -298,6 +431,57 @@ def _get_dbt_dag_task_group_identifier(dag: DAG, task_group: TaskGroup | None) -
     return dag_task_group_identifier
 
 
+def should_create_detached_nodes(render_config: RenderConfig) -> bool:
+    """
+    Decide if we should calculate / insert detached nodes into the graph.
+    """
+    return render_config.should_detach_multiple_parents_tests and render_config.test_behavior in (
+        TestBehavior.BUILD,
+        TestBehavior.AFTER_EACH,
+    )
+
+
+def identify_detached_nodes(
+    nodes: dict[str, DbtNode],
+    render_config: RenderConfig,
+    detached_nodes: dict[str, DbtNode],
+    detached_from_parent: dict[str, list[DbtNode]],
+) -> None:
+    """
+    Given the nodes that represent a dbt project and the test_behavior, identify the detached test nodes
+    (test nodes that have multiple dependencies and should run independently).
+
+    Change in-place the dictionaries detached_nodes (detached node ID : node) and detached_from_parent (parent node ID that
+    is upstream to this test and the test node).
+    """
+    if should_create_detached_nodes(render_config):
+        for node_id, node in nodes.items():
+            if is_detached_test(node):
+                detached_nodes[node_id] = node
+                for parent_id in node.depends_on:
+                    detached_from_parent[parent_id].append(node)
+
+
+_counter = 0
+
+
+def calculate_detached_node_name(node: DbtNode) -> str:
+    """
+    Given a detached test node, calculate its name. It will either be:
+     - the name of the test with a "_test" suffix, if this is smaller than 250
+     - or detached_{an incremental number}_test
+    """
+    # Note: this implementation currently relies on the fact that Airflow creates a new process
+    # to parse each DAG both in the scheduler and also in the worker nodes. We logged a ticket to improved this:
+    # https://github.com/astronomer/astronomer-cosmos/issues/1469
+    node_name = f"{node.resource_name.split('.')[0]}_test"
+    if not len(node_name) < AIRFLOW_MAX_ID_LENGTH:
+        global _counter
+        node_name = f"detached_{_counter}_test"
+        _counter += 1
+    return node_name
+
+
 def build_airflow_graph(
     nodes: dict[str, DbtNode],
     dag: DAG,  # Airflow-specific - parent DAG where to associate tasks and (optional) task groups
@@ -308,7 +492,7 @@ def build_airflow_graph(
     render_config: RenderConfig,
     task_group: TaskGroup | None = None,
     on_warning_callback: Callable[..., Any] | None = None,  # argument specific to the DBT test command
-) -> None:
+) -> dict[str, Union[TaskGroup, BaseOperator]]:
     """
     Instantiate dbt `nodes` as Airflow tasks within the given `task_group` (optional) or `dag` (mandatory).
 
@@ -331,12 +515,20 @@ def build_airflow_graph(
     :param task_group: Airflow Task Group instance
     :param on_warning_callback: A callback function called on warnings with additional Context variables “test_names”
     and “test_results” of type List.
+    :return: Dictionary mapping dbt nodes (node.unique_id to Airflow task)
     """
     node_converters = render_config.node_converters or {}
     test_behavior = render_config.test_behavior
     source_rendering_behavior = render_config.source_rendering_behavior
-    tasks_map = {}
+    normalize_task_id = render_config.normalize_task_id
+    tasks_map: dict[str, Union[TaskGroup, BaseOperator]] = {}
     task_or_group: TaskGroup | BaseOperator
+
+    # Identify test nodes that should be run detached from the associated dbt resource nodes because they
+    # have multiple parents
+    detached_nodes: dict[str, DbtNode] = OrderedDict()
+    detached_from_parent: dict[str, list[DbtNode]] = defaultdict(list)
+    identify_detached_nodes(nodes, render_config, detached_nodes, detached_from_parent)
 
     for node_id, node in nodes.items():
         conversion_function = node_converters.get(node.resource_type, generate_task_or_group)
@@ -356,7 +548,9 @@ def build_airflow_graph(
             source_rendering_behavior=source_rendering_behavior,
             test_indirect_selection=test_indirect_selection,
             on_warning_callback=on_warning_callback,
+            normalize_task_id=normalize_task_id,
             node=node,
+            detached_from_parent=detached_from_parent,
         )
         if task_or_group is not None:
             logger.debug(f"Conversion of <{node.unique_id}> was successful!")
@@ -377,9 +571,25 @@ def build_airflow_graph(
         leaves_ids = calculate_leaves(tasks_ids=list(tasks_map.keys()), nodes=nodes)
         for leaf_node_id in leaves_ids:
             tasks_map[leaf_node_id] >> test_task
+    elif test_behavior in (TestBehavior.BUILD, TestBehavior.AFTER_EACH):
+        # Handle detached test nodes
+        for node_id, node in detached_nodes.items():
+            datached_node_name = calculate_detached_node_name(node)
+            test_meta = create_test_task_metadata(
+                datached_node_name,
+                execution_mode,
+                test_indirect_selection,
+                task_args=task_args,
+                on_warning_callback=on_warning_callback,
+                render_config=render_config,
+                node=node,
+            )
+            test_task = create_airflow_task(test_meta, dag, task_group=task_group)
+            tasks_map[node_id] = test_task
 
     create_airflow_task_dependencies(nodes, tasks_map)
     _add_dbt_compile_task(nodes, dag, execution_mode, task_args, tasks_map, task_group)
+    return tasks_map
 
 
 def create_airflow_task_dependencies(

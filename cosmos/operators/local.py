@@ -31,7 +31,7 @@ from cosmos.cache import (
 from cosmos.constants import FILE_SCHEME_AIRFLOW_DEFAULT_CONN_ID_MAP, InvocationMode
 from cosmos.dataset import get_dataset_alias_name
 from cosmos.dbt.project import get_partial_parse_path, has_non_empty_dependencies_file
-from cosmos.exceptions import AirflowCompatibilityError, CosmosValueError
+from cosmos.exceptions import AirflowCompatibilityError, CosmosDbtRunError, CosmosValueError
 from cosmos.settings import remote_target_path, remote_target_path_conn_id
 
 try:
@@ -46,22 +46,26 @@ else:
 if TYPE_CHECKING:
     from airflow.datasets import Dataset  # noqa: F811
     from dbt.cli.main import dbtRunner, dbtRunnerResult
-    from openlineage.client.run import RunEvent
+
+    try:  # pragma: no cover
+        from openlineage.client.event_v2 import RunEvent  # pragma: no cover
+    except ImportError:  # pragma: no cover
+        from openlineage.client.run import RunEvent  # pragma: no cover
 
 
 from sqlalchemy.orm import Session
 
+import cosmos.dbt.runner as dbt_runner
 from cosmos.config import ProfileConfig
 from cosmos.constants import (
     OPENLINEAGE_PRODUCER,
 )
 from cosmos.dbt.parser.output import (
-    extract_dbt_runner_issues,
+    extract_freshness_warn_msg,
     extract_log_issues,
-    parse_number_of_warnings_dbt_runner,
     parse_number_of_warnings_subprocess,
 )
-from cosmos.dbt.project import change_working_directory, create_symlinks, environ
+from cosmos.dbt.project import create_symlinks
 from cosmos.hooks.subprocess import (
     FullOutputSubprocessHook,
     FullOutputSubprocessResult,
@@ -70,6 +74,7 @@ from cosmos.log import get_logger
 from cosmos.operators.base import (
     AbstractDbtBaseOperator,
     DbtBuildMixin,
+    DbtCloneMixin,
     DbtCompileMixin,
     DbtLSMixin,
     DbtRunMixin,
@@ -113,8 +118,7 @@ class DbtLocalBaseOperator(AbstractDbtBaseOperator):
 
     :param profile_args: Arguments to pass to the profile. See
         :py:class:`cosmos.providers.dbt.core.profiles.BaseProfileMapping`.
-    :param profile_name: A name to use for the dbt profile. If not provided, and no profile target is found
-        in your project's dbt_project.yml, "cosmos_profile" is used.
+    :param profile_config: ProfileConfig Object
     :param install_deps: If true, install dependencies before running the command
     :param callback: A callback function called on after a dbt run with a path to the dbt project directory.
     :param target_name: A name to use for the dbt target. If not provided, and no target is found
@@ -140,6 +144,7 @@ class DbtLocalBaseOperator(AbstractDbtBaseOperator):
         invocation_mode: InvocationMode | None = None,
         install_deps: bool = False,
         callback: Callable[[str], None] | None = None,
+        callback_args: dict[str, Any] | None = None,
         should_store_compiled_sql: bool = True,
         should_upload_compiled_sql: bool = False,
         append_env: bool = True,
@@ -148,6 +153,7 @@ class DbtLocalBaseOperator(AbstractDbtBaseOperator):
         self.task_id = task_id
         self.profile_config = profile_config
         self.callback = callback
+        self.callback_args = callback_args or {}
         self.compiled_sql = ""
         self.freshness = ""
         self.should_store_compiled_sql = should_store_compiled_sql
@@ -206,14 +212,12 @@ class DbtLocalBaseOperator(AbstractDbtBaseOperator):
         be used since it is faster than subprocess. If dbtRunner is not available, it will fall back to subprocess.
         This method is called at runtime to work in the environment where the operator is running.
         """
-        try:
-            from dbt.cli.main import dbtRunner  # noqa
-        except ImportError:
-            self.invocation_mode = InvocationMode.SUBPROCESS
-            self.log.info("Could not import dbtRunner. Falling back to subprocess for invoking dbt.")
-        else:
+        if dbt_runner.is_available():
             self.invocation_mode = InvocationMode.DBT_RUNNER
             self.log.info("dbtRunner is available. Using dbtRunner for invoking dbt.")
+        else:
+            self.invocation_mode = InvocationMode.SUBPROCESS
+            self.log.info("Could not import dbtRunner. Falling back to subprocess for invoking dbt.")
 
     def handle_exception_subprocess(self, result: FullOutputSubprocessResult) -> None:
         if self.skip_exit_code is not None and result.exit_code == self.skip_exit_code:
@@ -224,13 +228,7 @@ class DbtLocalBaseOperator(AbstractDbtBaseOperator):
 
     def handle_exception_dbt_runner(self, result: dbtRunnerResult) -> None:
         """dbtRunnerResult has an attribute `success` that is False if the command failed."""
-        if not result.success:
-            if result.exception:
-                raise AirflowException(f"dbt invocation did not complete with unhandled error: {result.exception}")
-            else:
-                node_names, node_results = extract_dbt_runner_issues(result, ["error", "fail", "runtime error"])
-                error_message = "\n".join([f"{name}: {result}" for name, result in zip(node_names, node_results)])
-                raise AirflowException(f"dbt invocation completed with errors: {error_message}")
+        return dbt_runner.handle_exception_if_needed(result)
 
     @provide_session
     def store_compiled_sql(self, tmp_project_dir: str, context: Context, session: Session = NEW_SESSION) -> None:
@@ -389,24 +387,12 @@ class DbtLocalBaseOperator(AbstractDbtBaseOperator):
 
     def run_dbt_runner(self, command: list[str], env: dict[str, str], cwd: str) -> dbtRunnerResult:
         """Invokes the dbt command programmatically."""
-        try:
-            from dbt.cli.main import dbtRunner
-        except ImportError:
-            raise ImportError(
+        if not dbt_runner.is_available():
+            raise CosmosDbtRunError(
                 "Could not import dbt core. Ensure that dbt-core >= v1.5 is installed and available in the environment where the operator is running."
             )
 
-        if self._dbt_runner is None:
-            self._dbt_runner = dbtRunner()
-
-        # Exclude the dbt executable path from the command
-        cli_args = command[1:]
-        self.log.info("Trying to run dbtRunner with:\n %s\n in %s", cli_args, cwd)
-
-        with change_working_directory(cwd), environ(env):
-            result = self._dbt_runner.invoke(cli_args)
-
-        return result
+        return dbt_runner.run_command(command, env, cwd)
 
     def _cache_package_lockfile(self, tmp_project_dir: Path) -> None:
         project_dir = Path(self.project_dir)
@@ -499,9 +485,10 @@ class DbtLocalBaseOperator(AbstractDbtBaseOperator):
                 self.store_freshness_json(tmp_project_dir, context)
                 self.store_compiled_sql(tmp_project_dir, context)
                 self.upload_compiled_sql(tmp_project_dir, context)
-                self.handle_exception(result)
                 if self.callback:
-                    self.callback(tmp_project_dir)
+                    self.callback_args.update({"context": context})
+                    self.callback(tmp_project_dir, **self.callback_args)
+                self.handle_exception(result)
 
                 return result
 
@@ -702,8 +689,36 @@ class DbtSourceLocalOperator(DbtSourceMixin, DbtLocalBaseOperator):
     Executes a dbt source freshness command.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, on_warning_callback: Callable[..., Any] | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self.on_warning_callback = on_warning_callback
+        self.extract_issues: Callable[..., tuple[list[str], list[str]]]
+
+    def _handle_warnings(self, result: FullOutputSubprocessResult | dbtRunnerResult, context: Context) -> None:
+        """
+         Handles warnings by extracting log issues, creating additional context, and calling the
+         on_warning_callback with the updated context.
+
+        :param result: The result object from the build and run command.
+        :param context: The original airflow context in which the build and run command was executed.
+        """
+        if self.invocation_mode == InvocationMode.SUBPROCESS:
+            self.extract_issues = extract_freshness_warn_msg
+        elif self.invocation_mode == InvocationMode.DBT_RUNNER:
+            self.extract_issues = dbt_runner.extract_message_by_status
+
+        test_names, test_results = self.extract_issues(result)
+
+        warning_context = dict(context)
+        warning_context["test_names"] = test_names
+        warning_context["test_results"] = test_results
+
+        self.on_warning_callback and self.on_warning_callback(warning_context)
+
+    def execute(self, context: Context) -> None:
+        result = self.build_and_run_cmd(context=context, cmd_flags=self.add_cmd_flags())
+        if self.on_warning_callback:
+            self._handle_warnings(result, context)
 
 
 class DbtRunLocalOperator(DbtRunMixin, DbtLocalBaseOperator):
@@ -756,8 +771,8 @@ class DbtTestLocalOperator(DbtTestMixin, DbtLocalBaseOperator):
             self.extract_issues = lambda result: extract_log_issues(result.full_output)
             self.parse_number_of_warnings = parse_number_of_warnings_subprocess
         elif self.invocation_mode == InvocationMode.DBT_RUNNER:
-            self.extract_issues = extract_dbt_runner_issues
-            self.parse_number_of_warnings = parse_number_of_warnings_dbt_runner
+            self.extract_issues = dbt_runner.extract_message_by_status
+            self.parse_number_of_warnings = dbt_runner.parse_number_of_warnings
 
     def execute(self, context: Context) -> None:
         result = self.build_and_run_cmd(context=context, cmd_flags=self.add_cmd_flags())
@@ -829,7 +844,7 @@ class DbtDocsCloudLocalOperator(DbtDocsLocalOperator, ABC):
         self.callback = self.upload_to_cloud_storage
 
     @abstractmethod
-    def upload_to_cloud_storage(self, project_dir: str) -> None:
+    def upload_to_cloud_storage(self, project_dir: str, **kwargs: Any) -> None:
         """Abstract method to upload the generated documentation to cloud storage."""
 
 
@@ -860,7 +875,7 @@ class DbtDocsS3LocalOperator(DbtDocsCloudLocalOperator):
             kwargs["connection_id"] = aws_conn_id
         super().__init__(*args, **kwargs)
 
-    def upload_to_cloud_storage(self, project_dir: str) -> None:
+    def upload_to_cloud_storage(self, project_dir: str, **kwargs: Any) -> None:
         """Uploads the generated documentation to S3."""
         self.log.info(
             'Attempting to upload generated docs to S3 using S3Hook("%s")',
@@ -926,7 +941,7 @@ class DbtDocsAzureStorageLocalOperator(DbtDocsCloudLocalOperator):
             kwargs["bucket_name"] = container_name
         super().__init__(*args, **kwargs)
 
-    def upload_to_cloud_storage(self, project_dir: str) -> None:
+    def upload_to_cloud_storage(self, project_dir: str, **kwargs: Any) -> None:
         """Uploads the generated documentation to Azure Blob Storage."""
         self.log.info(
             'Attempting to upload generated docs to Azure Blob Storage using WasbHook(conn_id="%s")',
@@ -970,7 +985,7 @@ class DbtDocsGCSLocalOperator(DbtDocsCloudLocalOperator):
 
     ui_color = "#4772d5"
 
-    def upload_to_cloud_storage(self, project_dir: str) -> None:
+    def upload_to_cloud_storage(self, project_dir: str, **kwargs: Any) -> None:
         """Uploads the generated documentation to Google Cloud Storage"""
         self.log.info(
             'Attempting to upload generated docs to Storage using GCSHook(conn_id="%s")',
@@ -1008,4 +1023,13 @@ class DbtDepsLocalOperator(DbtLocalBaseOperator):
 class DbtCompileLocalOperator(DbtCompileMixin, DbtLocalBaseOperator):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         kwargs["should_upload_compiled_sql"] = True
+        super().__init__(*args, **kwargs)
+
+
+class DbtCloneLocalOperator(DbtCloneMixin, DbtLocalBaseOperator):
+    """
+    Executes a dbt core clone command.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

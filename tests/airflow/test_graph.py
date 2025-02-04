@@ -13,6 +13,7 @@ from packaging import version
 from cosmos.airflow.graph import (
     _snake_case_to_camelcase,
     build_airflow_graph,
+    calculate_detached_node_name,
     calculate_leaves,
     calculate_operator_class,
     create_task_metadata,
@@ -40,6 +41,16 @@ parent_seed = DbtNode(
     resource_type=DbtResourceType.SEED,
     depends_on=[],
     file_path="",
+    config={
+        "meta": {
+            "cosmos": {
+                "profile_config": {
+                    "profile_name": "new_profile",
+                    "profile_mapping": {"profile_args": {"schema": "different"}},
+                }
+            }
+        }
+    },
 )
 parent_node = DbtNode(
     unique_id=f"{DbtResourceType.MODEL.value}.{SAMPLE_PROJ_PATH.stem}.parent",
@@ -62,7 +73,7 @@ child_node = DbtNode(
     depends_on=[parent_node.unique_id],
     file_path=SAMPLE_PROJ_PATH / "gen3/models/child.sql",
     tags=["nightly"],
-    config={"materialized": "table"},
+    config={"materialized": "table", "meta": {"cosmos": {"operator_kwargs": {"queue": "custom_queue"}}}},
 )
 
 child2_node = DbtNode(
@@ -71,11 +82,37 @@ child2_node = DbtNode(
     depends_on=[parent_node.unique_id],
     file_path=SAMPLE_PROJ_PATH / "gen3/models/child2_v2.sql",
     tags=["nightly"],
-    config={"materialized": "table"},
+    config={"materialized": "table", "meta": {"cosmos": {"operator_kwargs": {"pool": "custom_pool"}}}},
 )
 
 sample_nodes_list = [parent_seed, parent_node, test_parent_node, child_node, child2_node]
 sample_nodes = {node.unique_id: node for node in sample_nodes_list}
+
+
+def test_calculate_datached_node_name_under_is_under_250():
+    node = DbtNode(
+        unique_id="model.my_dbt_project.a_very_short_name",
+        resource_type=DbtResourceType.MODEL,
+        depends_on=[],
+        file_path="",
+    )
+    assert calculate_detached_node_name(node) == "a_very_short_name_test"
+
+    node = DbtNode(
+        unique_id="model.my_dbt_project." + "this_is_a_very_long_name" * 20,  # 24 x 20 = 480 characters
+        resource_type=DbtResourceType.MODEL,
+        depends_on=[],
+        file_path="",
+    )
+    assert calculate_detached_node_name(node) == "detached_0_test"
+
+    node = DbtNode(
+        unique_id="model.my_dbt_project." + "this_is_another_very_long_name" * 20,
+        resource_type=DbtResourceType.MODEL,
+        depends_on=[],
+        file_path="",
+    )
+    assert calculate_detached_node_name(node) == "detached_1_test"
 
 
 @pytest.mark.skipif(
@@ -227,6 +264,89 @@ def test_build_airflow_graph_with_after_all():
     assert dag.leaves[0].select == ["tag:some"]
 
 
+@pytest.mark.skipif(
+    version.parse(airflow_version) < version.parse("2.4"),
+    reason="Airflow DAG did not have task_group_dict until the 2.4 release",
+)
+@pytest.mark.integration
+def test_build_airflow_graph_with_build():
+    with DAG("test-id", start_date=datetime(2022, 1, 1)) as dag:
+        task_args = {
+            "project_dir": SAMPLE_PROJ_PATH,
+            "conn_id": "fake_conn",
+            "profile_config": ProfileConfig(
+                profile_name="default",
+                target_name="default",
+                profile_mapping=PostgresUserPasswordProfileMapping(
+                    conn_id="fake_conn",
+                    profile_args={"schema": "public"},
+                ),
+            ),
+        }
+        render_config = RenderConfig(
+            test_behavior=TestBehavior.BUILD,
+        )
+        build_airflow_graph(
+            nodes=sample_nodes,
+            dag=dag,
+            execution_mode=ExecutionMode.LOCAL,
+            test_indirect_selection=TestIndirectSelection.EAGER,
+            task_args=task_args,
+            dbt_project_name="astro_shop",
+            render_config=render_config,
+        )
+    topological_sort = [task.task_id for task in dag.topological_sort()]
+    expected_sort = ["seed_parent_seed_build", "parent_model_build", "child_model_build", "child2_v2_model_build"]
+    assert topological_sort == expected_sort
+
+    task_groups = dag.task_group_dict
+    assert len(task_groups) == 0
+
+    assert len(dag.leaves) == 2
+    assert dag.leaves[0].task_id in ("child_model_build", "child2_v2_model_build")
+    assert dag.leaves[1].task_id in ("child_model_build", "child2_v2_model_build")
+
+
+@pytest.mark.skipif(
+    version.parse(airflow_version) < version.parse("2.4"),
+    reason="Airflow DAG did not have task_group_dict until the 2.4 release",
+)
+@pytest.mark.integration
+def test_build_airflow_graph_with_override_profile_config():
+    nodes_subset = {parent_seed.unique_id: parent_seed, parent_node.unique_id: parent_node}
+
+    with DAG("test-id", start_date=datetime(2022, 1, 1)) as dag:
+        task_args = {
+            "project_dir": SAMPLE_PROJ_PATH,
+            "conn_id": "fake_conn",
+            "profile_config": ProfileConfig(
+                profile_name="default",
+                target_name="default",
+                profile_mapping=PostgresUserPasswordProfileMapping(
+                    conn_id="fake_conn",
+                    profile_args={"schema": "public"},
+                ),
+            ),
+        }
+        build_airflow_graph(
+            nodes=nodes_subset,
+            dag=dag,
+            execution_mode=ExecutionMode.LOCAL,
+            test_indirect_selection=TestIndirectSelection.EAGER,
+            task_args=task_args,
+            dbt_project_name="astro_shop",
+            render_config=RenderConfig(),
+        )
+
+    generated_seed_profile_config = dag.task_dict["seed_parent_seed"].profile_config
+    assert generated_seed_profile_config.profile_name == "new_profile"  # overridden via config
+    assert generated_seed_profile_config.profile_mapping.profile_args["schema"] == "different"  # overridden via config
+
+    generated_parent_profile_config = dag.task_dict["parent.run"].profile_config
+    assert generated_parent_profile_config.profile_name == "default"
+    assert generated_parent_profile_config.profile_mapping.profile_args["schema"] == "public"
+
+
 @pytest.mark.integration
 @patch("airflow.hooks.base.BaseHook.get_connection", new=MagicMock())
 def test_build_airflow_graph_with_dbt_compile_task():
@@ -242,7 +362,6 @@ def test_build_airflow_graph_with_dbt_compile_task():
             "project_dir": SAMPLE_PROJ_PATH,
             "conn_id": "fake_conn",
             "profile_config": bigquery_profile_config,
-            "location": "",
         }
         render_config = RenderConfig(
             select=["tag:some"],
@@ -568,6 +687,160 @@ def test_create_task_metadata_snapshot(caplog):
     assert metadata.arguments == {"models": "my_snapshot"}
 
 
+def _normalize_task_id(node: DbtNode) -> str:
+    """for test_create_task_metadata_normalize_task_id"""
+    return f"new_task_id_{node.name}_{node.resource_type.value}"
+
+
+@pytest.mark.skipif(
+    version.parse(airflow_version) < version.parse("2.9"),
+    reason="Airflow task did not have display_name until the 2.9 release",
+)
+@pytest.mark.parametrize(
+    "node_type,node_id,normalize_task_id,use_task_group,test_behavior,expected_node_id,expected_display_name",
+    [
+        # normalize_task_id is None (default)
+        (
+            DbtResourceType.MODEL,
+            f"{DbtResourceType.MODEL.value}.my_folder.test_node",
+            None,
+            False,
+            None,
+            "test_node_run",
+            None,
+        ),
+        (
+            DbtResourceType.SOURCE,
+            f"{DbtResourceType.SOURCE.value}.my_folder.test_node",
+            None,
+            False,
+            None,
+            "test_node_source",
+            None,
+        ),
+        (
+            DbtResourceType.SEED,
+            f"{DbtResourceType.SEED.value}.my_folder.test_node",
+            None,
+            False,
+            None,
+            "test_node_seed",
+            None,
+        ),
+        (
+            DbtResourceType.SEED,
+            f"{DbtResourceType.SEED.value}.my_folder.test_node",
+            None,
+            False,
+            TestBehavior.BUILD,
+            "test_node_seed_build",
+            None,
+        ),
+        # normalize_task_id is passed and use_task_group is False
+        (
+            DbtResourceType.MODEL,
+            f"{DbtResourceType.MODEL.value}.my_folder.test_node",
+            _normalize_task_id,
+            False,
+            None,
+            "new_task_id_test_node_model",
+            "test_node_run",
+        ),
+        (
+            DbtResourceType.SOURCE,
+            f"{DbtResourceType.MODEL.value}.my_folder.test_node",
+            _normalize_task_id,
+            False,
+            None,
+            "new_task_id_test_node_source",
+            "test_node_source",
+        ),
+        (
+            DbtResourceType.SEED,
+            f"{DbtResourceType.MODEL.value}.my_folder.test_node",
+            _normalize_task_id,
+            False,
+            None,
+            "new_task_id_test_node_seed",
+            "test_node_seed",
+        ),
+        (
+            DbtResourceType.SEED,
+            f"{DbtResourceType.MODEL.value}.my_folder.test_node",
+            _normalize_task_id,
+            False,
+            TestBehavior.BUILD,
+            "new_task_id_test_node_seed",
+            "test_node_seed_build",
+        ),
+        # normalize_task_id is passed and use_task_group is True
+        (
+            DbtResourceType.MODEL,
+            f"{DbtResourceType.MODEL.value}.my_folder.test_node",
+            _normalize_task_id,
+            True,
+            None,
+            "run",
+            None,
+        ),
+        (
+            DbtResourceType.SOURCE,
+            f"{DbtResourceType.MODEL.value}.my_folder.test_node",
+            _normalize_task_id,
+            True,
+            None,
+            "source",
+            None,
+        ),
+        (
+            DbtResourceType.SEED,
+            f"{DbtResourceType.MODEL.value}.my_folder.test_node",
+            _normalize_task_id,
+            True,
+            None,
+            "seed",
+            None,
+        ),
+        (
+            DbtResourceType.SEED,
+            f"{DbtResourceType.MODEL.value}.my_folder.test_node",
+            _normalize_task_id,
+            True,
+            TestBehavior.BUILD,
+            "build",
+            None,
+        ),
+    ],
+)
+def test_create_task_metadata_normalize_task_id(
+    node_type, node_id, normalize_task_id, use_task_group, test_behavior, expected_node_id, expected_display_name
+):
+    node = DbtNode(
+        unique_id=node_id,
+        resource_type=node_type,
+        depends_on=[],
+        file_path="",
+        tags=[],
+        config={},
+    )
+    args = {}
+    metadata = create_task_metadata(
+        node,
+        execution_mode=ExecutionMode.LOCAL,
+        args=args,
+        dbt_dag_task_group_identifier="",
+        use_task_group=use_task_group,
+        normalize_task_id=normalize_task_id,
+        source_rendering_behavior=SourceRenderingBehavior.ALL,
+        test_behavior=test_behavior,
+    )
+    assert metadata.id == expected_node_id
+    if expected_display_name:
+        assert metadata.arguments["task_display_name"] == expected_display_name
+    else:
+        assert "task_display_name" not in metadata.arguments
+
+
 @pytest.mark.parametrize(
     "node_type,node_unique_id,test_indirect_selection,additional_arguments",
     [
@@ -707,3 +980,42 @@ def test_owner(dbt_extra_config, expected_owner):
 
     assert len(output.leaves) == 1
     assert output.leaves[0].owner == expected_owner
+
+
+def test_custom_meta():
+    with DAG("test-id", start_date=datetime(2022, 1, 1)) as dag:
+        task_args = {
+            "project_dir": SAMPLE_PROJ_PATH,
+            "conn_id": "fake_conn",
+            "profile_config": ProfileConfig(
+                profile_name="default",
+                target_name="default",
+                profile_mapping=PostgresUserPasswordProfileMapping(
+                    conn_id="fake_conn",
+                    profile_args={"schema": "public"},
+                ),
+            ),
+        }
+        build_airflow_graph(
+            nodes=sample_nodes,
+            dag=dag,
+            execution_mode=ExecutionMode.LOCAL,
+            test_indirect_selection=TestIndirectSelection.EAGER,
+            task_args=task_args,
+            render_config=RenderConfig(
+                test_behavior=TestBehavior.AFTER_EACH,
+                source_rendering_behavior=SOURCE_RENDERING_BEHAVIOR,
+            ),
+            dbt_project_name="astro_shop",
+        )
+        # test custom meta (queue, pool)
+        for task in dag.tasks:
+            if task.task_id == "child2_v2_run":
+                assert task.pool == "custom_pool"
+            else:
+                assert task.pool == "default_pool"
+
+            if task.task_id == "child_run":
+                assert task.queue == "custom_queue"
+            else:
+                assert task.queue == "default"
