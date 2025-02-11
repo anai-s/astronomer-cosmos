@@ -265,7 +265,7 @@ class AbstractDbtBase(metaclass=ABCMeta):
     def build_and_run_cmd(
         self,
         context: Context,
-        cmd_flags: list[str] | None = None,
+        cmd_flags: list[str],
         run_as_async: bool = False,
         async_context: dict[str, Any] | None = None,
     ) -> Any:

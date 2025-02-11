@@ -109,12 +109,21 @@ class DbtGcpCloudRunJobBaseOperator(AbstractDbtBase, CloudRunExecuteJobOperator)
         self.log.info(f"Running command: {self.command}")
         result = CloudRunExecuteJobOperator.execute(self, context)
 
-        # Pull Google Cloud Run job logs from Google Cloud Logging to Airflow logs
+        return result
+
+    def fetch_remote_logs(self, result: Any) -> Any:
+        """
+        Pull Google Cloud Run job logs from Google Cloud Logging to Airflow logs
+
+        result: result from build and run command in Cloud Run Job
+        """
+
+        self.log.info("Attempt to retrieve logs from Google Cloud Logging")
+
         execution_name = result["latest_created_execution"]["name"]
         execution_time = result["latest_created_execution"]["create_time"]
         filter_ = f'resource.type = "cloud_run_job" AND resource.labels.job_name = "{self.job_name}" AND timestamp>="{execution_time}"'
 
-        self.log.info("Attempt to retrieve logs from Google Cloud Logging")
         time.sleep(5)  # Add sleep time to make sure all the job logs are available when we do the request
 
         # List to store log messages
@@ -126,7 +135,7 @@ class DbtGcpCloudRunJobBaseOperator(AbstractDbtBase, CloudRunExecuteJobOperator)
             entries = client.list_entries(filter_=filter_)
             self.log.info(f"Listing logs of the execution {execution_name}:")
             if not entries:
-                self.log.warning("No logs found for the Cloud Run job.")
+                self.log.info("No logs found for the Cloud Run job.")
             else:
                 for entry in entries:
                     # Search for logs associated with the job executed
@@ -138,6 +147,7 @@ class DbtGcpCloudRunJobBaseOperator(AbstractDbtBase, CloudRunExecuteJobOperator)
         except GoogleCloudError as e:
             # Catch Google Cloud-related errors (e.g., permission issues)
             self.log.warning(f"Warning: Error retrieving logs from Google Cloud Logging: {str(e)}")
+            return
             # Continue without raising an error, just log the warning
 
     def build_command(self, context: Context, cmd_flags: list[str] | None = None) -> None:
@@ -262,7 +272,8 @@ class DbtWarningGcpCloudRunJobOperator(DbtGcpCloudRunJobBaseOperator, ABC):
 
     def execute(self, context: Context, **kwargs: Any) -> None:
         result = self.build_and_run_cmd(context=context, cmd_flags=self.add_cmd_flags())
-        log_list = [log for log in result if type(log) == str]  # clean log list with only string type values
+        log_messages = self.fetch_remote_logs(result)
+        log_list = [log for log in log_messages if type(log) == str]  # clean log list with only string type values
 
         if not (
             isinstance(context["task_instance"], TaskInstance)
