@@ -111,9 +111,13 @@ class DbtGcpCloudRunJobBaseOperator(AbstractDbtBase, CloudRunExecuteJobOperator)
 
         return result
 
-    def fetch_remote_logs(self, result: Any) -> Any:
+    def fetch_remote_logs(
+        self,
+        result: Any
+    ) -> Any:
         """
-        Pull Google Cloud Run job logs from Google Cloud Logging to Airflow logs
+        Fetch Google Cloud Run job logs from Google Cloud Logging to Airflow logs
+        The function returns the a list of the log messages
 
         result: result from build and run command in Cloud Run Job
         """
@@ -126,23 +130,22 @@ class DbtGcpCloudRunJobBaseOperator(AbstractDbtBase, CloudRunExecuteJobOperator)
 
         time.sleep(5)  # Add sleep time to make sure all the job logs are available when we do the request
 
-        # List to store log messages
-        log_messages = []
-
         try:
             client = logging.Client(project=self.project_id)
-            # Search for logs associated with the job name
+            # Fetch logs associated with the job_name
             entries = client.list_entries(filter_=filter_)
-            self.log.info(f"Listing logs of the execution {execution_name}:")
-            if not entries:
-                self.log.info("No logs found for the Cloud Run job.")
-            else:
-                for entry in entries:
-                    # Search for logs associated with the job executed
-                    if entry.labels["run.googleapis.com/execution_name"] == execution_name:
-                        log_messages.append(entry.payload)
-                        self.log.info(f"Cloud Run Log: {entry.payload}")
-                return log_messages
+            self.log.info(f"Listing logs of the execution {execution_name} at {execution_time}:")
+            
+            # List to store log messages
+            log_messages = []
+
+            for entry in entries:
+                # Search for logs associated with the job executed
+                if entry.labels["run.googleapis.com/execution_name"] == execution_name:
+                    log_messages.append(entry.payload)
+                    self.log.info(f"Cloud Run Log: {entry.payload}")
+
+            return log_messages
 
         except GoogleCloudError as e:
             # Catch Google Cloud-related errors (e.g., permission issues)
@@ -272,31 +275,23 @@ class DbtWarningGcpCloudRunJobOperator(DbtGcpCloudRunJobBaseOperator, ABC):
 
     def execute(self, context: Context, **kwargs: Any) -> None:
         result = self.build_and_run_cmd(context=context, cmd_flags=self.add_cmd_flags())
-        log_messages = self.fetch_remote_logs(result)
-        log_list = [log for log in log_messages if type(log) == str]  # clean log list with only string type values
-
-        if not (
-            isinstance(context["task_instance"], TaskInstance)
-            and (
-                isinstance(context["task_instance"].task, DbtTestGcpCloudRunJobOperator)
-                or isinstance(context["task_instance"].task, DbtSourceGcpCloudRunJobOperator)
-            )
-        ):
-            return
-
+        log_list = self.fetch_remote_logs(result)
+        clean_log_list = [log for log in log_list if type(log) == str]
+        
         should_trigger_callback = all(
             [
-                log_list,
+                clean_log_list,
                 self.on_warning_callback,
-                DBT_NO_TESTS_MSG not in log_list[-2],
-                DBT_WARN_MSG in log_list[-2],
+                DBT_NO_TESTS_MSG not in clean_log_list[-2],
+                DBT_WARN_MSG in clean_log_list[-2],
+                (isinstance(val, str) for val in clean_log_list),
             ]
         )
 
         if should_trigger_callback:
-            warnings = int(log_list[-2].split(f"{DBT_WARN_MSG}=")[1].split()[0])
+            warnings = int(clean_log_list[-2].split(f"{DBT_WARN_MSG}=")[1].split()[0])
             if warnings > 0:
-                self._handle_warnings(log_list, context)
+                self._handle_warnings(clean_log_list, context)
 
 
 class DbtTestGcpCloudRunJobOperator(DbtTestMixin, DbtWarningGcpCloudRunJobOperator):
