@@ -5,7 +5,6 @@ import time
 from abc import ABC
 from typing import Any, Callable, Sequence
 
-from airflow.models import TaskInstance
 from airflow.utils.context import Context
 
 from cosmos.config import ProfileConfig
@@ -111,10 +110,7 @@ class DbtGcpCloudRunJobBaseOperator(AbstractDbtBase, CloudRunExecuteJobOperator)
 
         return result
 
-    def fetch_remote_logs(
-        self,
-        result: Any
-    ) -> Any:
+    def fetch_remote_logs(self, result: Any) -> Any:
         """
         Fetch Google Cloud Run job logs from Google Cloud Logging to Airflow logs
         The function returns the a list of the log messages
@@ -135,7 +131,7 @@ class DbtGcpCloudRunJobBaseOperator(AbstractDbtBase, CloudRunExecuteJobOperator)
             # Fetch logs associated with the job_name
             entries = client.list_entries(filter_=filter_)
             self.log.info(f"Listing logs of the execution {execution_name} at {execution_time}:")
-            
+
             # List to store log messages
             log_messages = []
 
@@ -277,7 +273,7 @@ class DbtWarningGcpCloudRunJobOperator(DbtGcpCloudRunJobBaseOperator, ABC):
         result = self.build_and_run_cmd(context=context, cmd_flags=self.add_cmd_flags())
         log_list = self.fetch_remote_logs(result)
         clean_log_list = [log for log in log_list if type(log) == str]
-        
+
         should_trigger_callback = all(
             [
                 clean_log_list,
