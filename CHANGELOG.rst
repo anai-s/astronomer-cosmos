@@ -1,7 +1,60 @@
 Changelog
 =========
 
-1.9.0a5 (2025-02-03)
+1.9.2 (2025-03-18)
+------------------
+
+Bug Fixes
+
+* Detach dbt vars used to render DAGs from the operator args' by @tatiana in #1616
+
+Enhancements
+
+* Support filtering by config meta nested properties by @tatiana in #1617
+
+Others
+
+* Update contributing.rst to latest test matrix by @tatiana in #1614
+* Pre-commit updates: #1615
+
+
+1.9.1 (2025-03-13)
+--------------------
+
+Bug Fixes
+
+* Fix import error in dbt bigquery adapter mock for ``dbt-bigquery<1.8`` for ``ExecutionMode.AIRFLOW_ASYNC`` by @pankajkoti in #1548
+* Fix ``operator_args`` override configuration by @ghjklw in #1558
+* Fix missing ``install_dbt_deps`` in ``ProjectConfig`` ``__init__`` method by @ghjklw in #1556
+* Fix dbt project parsing ``dbt_vars`` behavior passed via ``operator_args`` by @AlexandrKhabarov in #1543
+* Avoid reading the connection during DAG parsing of the async BigQuery operator by @joppevos in #1582
+* Fix: Workaround to incorrectly raised ``gcsfs.retry.HttpError`` (Invalid Credentials, 401) by @tatiana in #1598
+* Fix the async execution mode read sql files for dbt packages by @pankajastro in #1588
+* Improve BQ async error handling by @tatiana in #1597
+* Fix path selector when ``manifest.json`` is created using MS Windows by @tatiana in #1601
+* Fix log that prints 'Total filtered nodes' by @tatiana in #1603
+* Fix select behaviour using ``LoadMode.MANIFEST`` and a path with star by @tatiana in #1602
+* Support ``on_warning_callback`` with ``TestBehavior.BUILD`` and ``ExecutionMode.LOCAL`` by @corsettigyg in #1571
+* Fix ``DbtRunLocalOperator.partial()`` support by @tatiana @ashb in #1609
+* fix: ``container_name`` is null for ecs integration by @nicor88 in #1592
+
+Docs
+
+* Improve MWAA getting-started docs by removing unused imports by @jx2lee in #1562
+
+Others
+
+* Disable ``example_cosmos_dbt_build.py`` DAG in CI by @pankajastro in #1567
+* Upgrade GitHub Actions Ubuntu version by @tatiana in #1561
+* Update GitHub bug issue template by @pankajastro in #1586
+* Enable DAG ``example_cosmos_dbt_build.py`` in CI by @pankajastro in #1573
+* Run async DAG in DAG without setup/teardown task by @pankajastro in #1599
+* Add test case that fully covers recent select issue by @tatiana in #1604
+* Add CI job to test multiple dbt versions for the async DAG by @pankajkoti in #1535
+* Improve unit tests speed from 89s to 14s by @tatiana in #1600
+* Pre-commit updates: #1560, #1583, #1596
+
+1.9.0 (2025-02-19)
 --------------------
 
 Breaking changes
@@ -19,23 +72,43 @@ Features
 * Add structure to support multiple db for async operator execution by @pankajastro in #1483
 * Support overriding the ``profile_config`` per dbt node or folder using config by @tatiana in #1492. More information `here <https://astronomer.github.io/astronomer-cosmos/profiles/#profile-customise-per-node>`_.
 * Create and run accurate SQL statements when using ``ExecutionMode.AIRFLOW_ASYNC`` by @pankajkoti, @tatiana and @pankajastro in #1474
+* Add AWS ECS task run execution mode by @CarlosGitto and @aoelvp94 in #1507
+* Add support for running ``DbtSourceOperator`` individually by @victormacaubas in #1510
+* Add setup task for async executions by @pankajastro in #1518
+* Add teardown task for async executions by @pankajastro in #1529
+* Add ``ProjectConfig.install_dbt_deps`` & change operator ``install_deps=True`` as default by @tatiana in #1521
+* Extend Virtualenv operator and mock dbt adapters for setup & teardown tasks in ``ExecutionMode.AIRFLOW_ASYNC`` by @pankajkoti, @tatiana and @pankajastro in #1544
 
 Bug Fixes
 
 * Fix select complex intersection of three tag-based graph selectors by @tatiana in #1466
+* Fix custom selector behaviour when the model name contains periods by @yakovlevvs and @60098727 in #1499
+* Filter dbt and non-dbt kwargs correctly for async operator by @pankajastro in #1526
 
 Enhancement
 
 * Fix OpenLineage deprecation warning by @CorsettiS in #1449
 * Move ``DbtRunner`` related functions into ``dbt/runner.py`` module by @tatiana in #1480
 * Add ``on_warning_callback`` to ``DbtSourceKubernetesOperator`` and refactor previous operators by @LuigiCerone in #1501
+* Gracefully error when users set incompatible ``RenderConfig.dbt_deps`` and ``operator_args`` ``install_deps`` by @tatiana in #1505
+* Store compiled SQL as template field for ``ExecutionMode.AIRFLOW_ASYNC`` by @pankajkoti in #1534
 
+Docs
+
+* Improve ``RenderConfig`` arguments documentation by @tatiana in #1514
+* Improve callback documentation by @tatiana in #1516
+* Improve partial parsing docs by @tatiana in #1520
+* Fix typo in selecting & excluding docs by @pankajastro in #1523
+* Document ``async_py_requirements`` added in ``ExecutionConfig`` for ``ExecutionMode.AIRFLOW_ASYNC`` by @pankajkoti in #1545
 
 Others
 
 * Ignore dbt package tests when running Cosmos tests by @tatiana in #1502
+* Refactor to consolidate async dbt adapter code by @pankajkoti in #1509
+* Log elapsed time for sql file(s) upload/download by @pankajastro in #1536
+* Remove the fallback operator for async task by @pankajastro in #1538
 * GitHub Actions Dependabot: #1487
-* Pre-commit updates: #1473, #1493
+* Pre-commit updates: #1473, #1493, #1503, #1531
 
 
 1.8.2 (2025-01-15)

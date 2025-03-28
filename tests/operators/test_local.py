@@ -5,7 +5,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, call, mock_open, patch
 
 import pytest
 from airflow import DAG
@@ -664,7 +664,17 @@ def test_run_test_operator_with_callback(invocation_mode, failing_test_dbt_proje
             on_warning_callback=on_warning_callback,
             invocation_mode=invocation_mode,
         )
-        run_operator >> test_operator
+
+        build_operator = DbtBuildLocalOperator(
+            profile_config=mini_profile_config,
+            project_dir=failing_test_dbt_project,
+            task_id="build",
+            append_env=True,
+            on_warning_callback=on_warning_callback,
+            invocation_mode=invocation_mode,
+        )
+
+        run_operator >> build_operator >> test_operator
     run_test_dag(dag)
     assert on_warning_callback.called
 
@@ -1143,7 +1153,7 @@ def test_store_freshness_json(mock_path_class, mock_context, mock_session):
     expected_freshness = json.dumps({"key": "value"}, indent=4)
 
     # Call the method under test
-    instance.store_freshness_json(tmp_project_dir="/mock/dir", context=mock_context, session=mock_session)
+    instance.store_freshness_json(tmp_project_dir="/mock/dir", context=mock_context)
 
     # Verify the freshness attribute is set correctly
     assert instance.freshness == expected_freshness
@@ -1164,7 +1174,7 @@ def test_store_freshness_json_no_file(mock_path_class, mock_context, mock_sessio
     mock_sources_json_path.exists.return_value = False
 
     # Call the method under test
-    instance.store_freshness_json(tmp_project_dir="/mock/dir", context=mock_context, session=mock_session)
+    instance.store_freshness_json(tmp_project_dir="/mock/dir", context=mock_context)
 
     # Verify the freshness attribute is set correctly
     assert instance.freshness == ""
@@ -1179,7 +1189,7 @@ def test_store_freshness_not_store_compiled_sql(mock_context, mock_session):
     )
 
     # Call the method under test
-    instance.store_freshness_json(tmp_project_dir="/mock/dir", context=mock_context, session=mock_session)
+    instance.store_freshness_json(tmp_project_dir="/mock/dir", context=mock_context)
 
     # Verify the freshness attribute is set correctly
     assert instance.freshness == ""
@@ -1431,10 +1441,10 @@ def test_mock_dbt_adapter_unsupported_profile_type():
 
 @patch("airflow.providers.google.cloud.operators.bigquery.BigQueryInsertJobOperator.execute")
 @patch("cosmos.operators.local.AbstractDbtLocalBase._read_run_sql_from_target_dir")
-def test_async_execution_without_start_task(mock_read_sql, mock_bq_execute, monkeypatch):
+@patch("cosmos.operators.local.settings.enable_setup_async_task", False)
+def test_async_execution_without_start_task(mock_read_sql, mock_bq_execute):
     from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
 
-    monkeypatch.setattr("cosmos.operators.local.enable_setup_async_task", False)
     mock_read_sql.return_value = "select * from 1;"
     operator = DbtRunLocalOperator(
         task_id="test",
@@ -1445,3 +1455,39 @@ def test_async_execution_without_start_task(mock_read_sql, mock_bq_execute, monk
         "/tmp", {}, {"profile_type": "bigquery", "async_operator": BigQueryInsertJobOperator}
     )
     mock_bq_execute.assert_called_once()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not AIRFLOW_IO_AVAILABLE, reason="Airflow did not have Object Storage until the 2.8 release")
+@patch("pathlib.Path.rglob")
+@patch("cosmos.operators.local.AbstractDbtLocalBase._construct_dest_file_path")
+@patch("airflow.io.path.ObjectStoragePath.unlink")
+def test_async_execution_teardown_delete_files(mock_unlink, mock_construct_dest_file_path, mock_rglob):
+    mock_file = MagicMock()
+    mock_file.is_file.return_value = True
+    mock_file.__str__.return_value = "/altered_jaffle_shop/target/run/file1.sql"
+    mock_rglob.return_value = [mock_file]
+    project_dir = Path(__file__).parent.parent.parent / "dev/dags/dbt/altered_jaffle_shop"
+    operator = DbtRunLocalOperator(
+        task_id="test",
+        project_dir=project_dir,
+        profile_config=profile_config,
+    )
+    operator._handle_async_execution(project_dir, {}, {"profile_type": "bigquery", "teardown_task": True})
+    mock_unlink.assert_called()
+
+
+def test_read_run_sql_from_target_dir():
+    tmp_project_dir = "/tmp/project"
+    sql_context = {"dbt_node_config": {"file_path": "/path/to/file.sql"}, "package_name": "package_name"}
+
+    operator = DbtRunLocalOperator(
+        task_id="test",
+        project_dir="/tmp",
+        profile_config=profile_config,
+    )
+
+    expected_sql_content = "SELECT * FROM my_table;"
+    with patch("pathlib.Path.open", new_callable=mock_open, read_data=expected_sql_content):
+        result = operator._read_run_sql_from_target_dir(tmp_project_dir, sql_context)
+        assert result == expected_sql_content

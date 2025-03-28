@@ -155,15 +155,12 @@ def validate_initial_user_config(
             raise CosmosValueError(
                 "ProjectConfig.env_vars and operator_args with 'env' are mutually exclusive and only one can be used."
             )
-    if "vars" in operator_args:
+    if "install_deps" in operator_args:
         warn(
-            "operator_args with 'vars' is deprecated since Cosmos 1.3 and will be removed in Cosmos 2.0. Use ProjectConfig.vars instead.",
+            "The operator argument `install_deps` is deprecated since Cosmos 1.9 and will be removed in Cosmos 2.0. Use `ProjectConfig.install_dbt_deps` instead.",
             DeprecationWarning,
         )
-        if project_config.dbt_vars:
-            raise CosmosValueError(
-                "ProjectConfig.dbt_vars and operator_args with 'vars' are mutually exclusive and only one can be used."
-            )
+
     # Cosmos 2.0 will remove the ability to pass RenderConfig.env_vars in place of ProjectConfig.env_vars, check that both are not set.
     if project_config.env_vars and render_config.env_vars:
         raise CosmosValueError(
@@ -196,6 +193,31 @@ def validate_changed_config_paths(
         )
 
 
+def override_configuration(
+    project_config: ProjectConfig, render_config: RenderConfig, execution_config: ExecutionConfig, operator_args: dict
+) -> None:
+    """
+    There are a few scenarios where a configuration should override another one.
+    This function changes, in place, render_config, execution_config and operator_args depending on other configurations.
+    """
+    if project_config.dbt_project_path:
+        render_config.project_path = project_config.dbt_project_path
+        execution_config.project_path = project_config.dbt_project_path
+
+    if render_config.dbt_deps is None:
+        render_config.dbt_deps = project_config.install_dbt_deps
+
+    if execution_config.dbt_executable_path:
+        operator_args["dbt_executable_path"] = execution_config.dbt_executable_path
+
+    if execution_config.invocation_mode:
+        operator_args["invocation_mode"] = execution_config.invocation_mode
+
+    if execution_config.execution_mode in (ExecutionMode.LOCAL, ExecutionMode.VIRTUALENV):
+        if "install_deps" not in operator_args:
+            operator_args["install_deps"] = project_config.install_dbt_deps
+
+
 class DbtToAirflowConverter:
     """
     Logic common to build an Airflow DbtDag and DbtTaskGroup from a DBT project.
@@ -225,35 +247,22 @@ class DbtToAirflowConverter:
         **kwargs: Any,
     ) -> None:
 
+        # We copy the configuration so the changes introduced in this method, such as override_configuration,
+        # do not affect other DAGs or TaskGroups that may reuse the same original configuration
+        execution_config = copy.deepcopy(execution_config) if execution_config is not None else ExecutionConfig()
+        render_config = copy.deepcopy(render_config) if render_config is not None else RenderConfig()
+        operator_args = copy.deepcopy(operator_args) if operator_args is not None else {}
+
         project_config.validate_project()
-
-        execution_config = execution_config or ExecutionConfig()
-        render_config = render_config or RenderConfig()
-        operator_args = operator_args or {}
-
         validate_initial_user_config(execution_config, profile_config, project_config, render_config, operator_args)
-
-        if project_config.dbt_project_path:
-            # We copy the configuration so the change does not affect other DAGs or TaskGroups
-            # that may reuse the same original configuration
-            render_config = copy.deepcopy(render_config)
-            execution_config = copy.deepcopy(execution_config)
-            render_config.project_path = project_config.dbt_project_path
-            execution_config.project_path = project_config.dbt_project_path
-
+        override_configuration(project_config, render_config, execution_config, operator_args)
         validate_changed_config_paths(execution_config, project_config, render_config)
-
-        env_vars = project_config.env_vars or operator_args.get("env")
-        dbt_vars = project_config.dbt_vars or operator_args.get("vars")
 
         if execution_config.execution_mode != ExecutionMode.VIRTUALENV and execution_config.virtualenv_dir is not None:
             logger.warning(
                 "`ExecutionConfig.virtualenv_dir` is only supported when \
                 ExecutionConfig.execution_mode is set to ExecutionMode.VIRTUALENV."
             )
-
-        if not operator_args:
-            operator_args = {}
 
         cache_dir = None
         cache_identifier = None
@@ -269,7 +278,7 @@ class DbtToAirflowConverter:
             profile_config=profile_config,
             cache_dir=cache_dir,
             cache_identifier=cache_identifier,
-            dbt_vars=dbt_vars,
+            dbt_vars=project_config.dbt_vars,
             airflow_metadata=cache._get_airflow_metadata(dag, task_group),
         )
         self.dbt_graph.load(method=render_config.load_method, execution_mode=execution_config.execution_mode)
@@ -281,6 +290,8 @@ class DbtToAirflowConverter:
         )
         previous_time = current_time
 
+        env_vars = operator_args.get("env") or project_config.env_vars
+        dbt_vars = operator_args.get("vars") or project_config.dbt_vars
         task_args = {
             **operator_args,
             "project_dir": execution_config.project_path,
@@ -291,10 +302,6 @@ class DbtToAirflowConverter:
             "vars": dbt_vars,
             "cache_dir": cache_dir,
         }
-        if execution_config.dbt_executable_path:
-            task_args["dbt_executable_path"] = execution_config.dbt_executable_path
-        if execution_config.invocation_mode:
-            task_args["invocation_mode"] = execution_config.invocation_mode
 
         validate_arguments(
             execution_config=execution_config,
@@ -317,6 +324,7 @@ class DbtToAirflowConverter:
             dbt_project_name=render_config.project_name,
             on_warning_callback=on_warning_callback,
             render_config=render_config,
+            async_py_requirements=execution_config.async_py_requirements,
         )
 
         current_time = time.perf_counter()

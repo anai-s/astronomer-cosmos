@@ -55,7 +55,7 @@ class RenderConfig:
     :param select: A list of dbt select arguments (e.g. 'config.materialized:incremental')
     :param exclude: A list of dbt exclude arguments (e.g. 'tag:nightly')
     :param selector: Name of a dbt YAML selector to use for parsing. Only supported when using ``load_method=LoadMode.DBT_LS``.
-    :param dbt_deps: Configure to run dbt deps when using dbt ls for dag parsing
+    :param dbt_deps: (deprecated) Configure to run dbt deps when using dbt ls for dag parsing
     :param node_converters: a dictionary mapping a ``DbtResourceType`` into a callable. Users can control how to render dbt nodes in Airflow. Only supported when using ``load_method=LoadMode.DBT_MANIFEST`` or ``LoadMode.DBT_LS``.
     :param dbt_executable_path: The path to the dbt executable for dag generation. Defaults to dbt if available on the path.
     :param env_vars: (Deprecated since Cosmos 1.3 use ProjectConfig.env_vars) A dictionary of environment variables for rendering. Only supported when using ``LoadMode.DBT_LS``.
@@ -75,7 +75,7 @@ class RenderConfig:
     select: list[str] = field(default_factory=list)
     exclude: list[str] = field(default_factory=list)
     selector: str | None = None
-    dbt_deps: bool = True
+    dbt_deps: bool | None = None
     node_converters: dict[DbtResourceType, Callable[..., Any]] | None = None
     dbt_executable_path: str | Path = get_system_dbt()
     env_vars: dict[str, str] | None = None
@@ -92,6 +92,11 @@ class RenderConfig:
         if self.env_vars:
             warnings.warn(
                 "RenderConfig.env_vars is deprecated since Cosmos 1.3 and will be removed in Cosmos 2.0. Use ProjectConfig.env_vars instead.",
+                DeprecationWarning,
+            )
+        if self.dbt_deps is not None:
+            warnings.warn(
+                "RenderConfig.dbt_deps is deprecated since Cosmos 1.9 and will be removed in Cosmos 2.0. Use ProjectConfig.install_dbt_deps instead.",
                 DeprecationWarning,
             )
         self.project_path = Path(dbt_project_path) if dbt_project_path else None
@@ -141,11 +146,13 @@ class ProjectConfig:
     Class for setting project config.
 
     :param dbt_project_path: The path to the dbt project directory. Example: /path/to/dbt/project. Defaults to None
+    :param install_dbt_deps: Run dbt deps during DAG parsing and task execution. Defaults to True.
     :param models_relative_path: The relative path to the dbt models directory within the project. Defaults to models
     :param seeds_relative_path: The relative path to the dbt seeds directory within the project. Defaults to seeds
     :param snapshots_relative_path: The relative path to the dbt snapshots directory within the project. Defaults to
     snapshots
     :param manifest_path: The absolute path to the dbt manifest file. Defaults to None
+    :param manifest_conn_id: Name of the Airflow connection used to access the manifest file if it is not stored locally. Defaults to None
     :param project_name: Allows the user to define the project name.
     Required if dbt_project_path is not defined. Defaults to the folder name of dbt_project_path.
     :param env_vars: Dictionary of environment variables that are used for both rendering and execution. Rendering with
@@ -159,6 +166,7 @@ class ProjectConfig:
     """
 
     dbt_project_path: Path | None = None
+    install_dbt_deps: bool = True
     manifest_path: Path | None = None
     models_path: Path | None = None
     seeds_path: Path | None = None
@@ -168,6 +176,7 @@ class ProjectConfig:
     def __init__(
         self,
         dbt_project_path: str | Path | None = None,
+        install_dbt_deps: bool = True,
         models_relative_path: str | Path = "models",
         seeds_relative_path: str | Path = "seeds",
         snapshots_relative_path: str | Path = "snapshots",
@@ -221,6 +230,7 @@ class ProjectConfig:
         self.env_vars = env_vars
         self.dbt_vars = dbt_vars
         self.partial_parse = partial_parse
+        self.install_dbt_deps = install_dbt_deps
 
     def validate_project(self) -> None:
         """
@@ -391,6 +401,8 @@ class ExecutionConfig:
     :param dbt_project_path: Configures the DBT project location accessible at runtime for dag execution. This is the project path in a docker container for ExecutionMode.DOCKER or ExecutionMode.KUBERNETES. Mutually Exclusive with ProjectConfig.dbt_project_path
     :param virtualenv_dir: Directory path to locate the (cached) virtual env that
     should be used for execution when execution mode is set to `ExecutionMode.VIRTUALENV`
+    :param async_py_requirements:  A list of Python packages to install when `ExecutionMode.AIRFLOW_ASYNC`(Experimental) is used. This parameter is required only if both `enable_setup_async_task` and `enable_teardown_async_task` are set to `True`.
+    Example: `["dbt-postgres==1.5.0"]`
     """
 
     execution_mode: ExecutionMode = ExecutionMode.LOCAL
@@ -402,6 +414,7 @@ class ExecutionConfig:
     virtualenv_dir: str | Path | None = None
 
     project_path: Path | None = field(init=False)
+    async_py_requirements: list[str] | None = None
 
     def __post_init__(self, dbt_project_path: str | Path | None) -> None:
         if self.invocation_mode and self.execution_mode not in (ExecutionMode.LOCAL, ExecutionMode.VIRTUALENV):

@@ -12,6 +12,7 @@ from airflow.utils.task_group import TaskGroup
 from cosmos.config import RenderConfig
 from cosmos.constants import (
     DBT_SETUP_ASYNC_TASK_ID,
+    DBT_TEARDOWN_ASYNC_TASK_ID,
     DEFAULT_DBT_RESOURCES,
     SUPPORTED_BUILD_RESOURCES,
     TESTABLE_DBT_RESOURCES,
@@ -24,8 +25,9 @@ from cosmos.constants import (
 from cosmos.core.airflow import get_airflow_task as create_airflow_task
 from cosmos.core.graph.entities import Task as TaskMetadata
 from cosmos.dbt.graph import DbtNode
+from cosmos.exceptions import CosmosValueError
 from cosmos.log import get_logger
-from cosmos.settings import enable_setup_async_task
+from cosmos.settings import enable_setup_async_task, enable_teardown_async_task
 
 logger = get_logger(__name__)
 
@@ -265,9 +267,11 @@ def create_task_metadata(
         extra_context: dict[str, Any] = {
             "dbt_node_config": node.context_dict,
             "dbt_dag_task_group_identifier": dbt_dag_task_group_identifier,
+            "package_name": node.package_name,
         }
 
         if test_behavior == TestBehavior.BUILD and node.resource_type in SUPPORTED_BUILD_RESOURCES:
+            args["on_warning_callback"] = on_warning_callback
             exclude_detached_tests_if_needed(node, args, detached_from_parent)
             task_id, args = _get_task_id_and_args(
                 node, args, use_task_group, normalize_task_id, "build", include_resource_type=True
@@ -412,14 +416,19 @@ def _add_dbt_setup_async_task(
     tasks_map: dict[str, Any],
     task_group: TaskGroup | None,
     render_config: RenderConfig | None = None,
+    async_py_requirements: list[str] | None = None,
 ) -> None:
     if execution_mode != ExecutionMode.AIRFLOW_ASYNC:
         return
+
+    if not async_py_requirements:
+        raise CosmosValueError("ExecutionConfig.AIRFLOW_ASYNC needs async_py_requirements to be set")
 
     if render_config is not None:
         task_args["select"] = render_config.select
         task_args["selector"] = render_config.selector
         task_args["exclude"] = render_config.exclude
+        task_args["py_requirements"] = async_py_requirements
 
     setup_task_metadata = TaskMetadata(
         id=DBT_SETUP_ASYNC_TASK_ID,
@@ -487,6 +496,42 @@ def calculate_detached_node_name(node: DbtNode) -> str:
     return node_name
 
 
+def _add_teardown_task(
+    dag: DAG,
+    execution_mode: ExecutionMode,
+    task_args: dict[str, Any],
+    tasks_map: dict[str, Any],
+    task_group: TaskGroup | None,
+    render_config: RenderConfig | None = None,
+    async_py_requirements: list[str] | None = None,
+) -> None:
+    if execution_mode != ExecutionMode.AIRFLOW_ASYNC:
+        return
+
+    if not async_py_requirements:
+        raise CosmosValueError("ExecutionConfig.AIRFLOW_ASYNC needs async_py_requirements to be set")
+
+    if render_config is not None:
+        task_args["select"] = render_config.select
+        task_args["selector"] = render_config.selector
+        task_args["exclude"] = render_config.exclude
+        task_args["py_requirements"] = async_py_requirements
+
+    teardown_task_metadata = TaskMetadata(
+        id=DBT_TEARDOWN_ASYNC_TASK_ID,
+        operator_class="cosmos.operators._asynchronous.TeardownAsyncOperator",
+        arguments=task_args,
+        extra_context={"dbt_dag_task_group_identifier": _get_dbt_dag_task_group_identifier(dag, task_group)},
+    )
+    teardown_airflow_task = create_airflow_task(teardown_task_metadata, dag, task_group=task_group)
+
+    for task_id, task in tasks_map.items():
+        if len(task.downstream_list) == 0:
+            task >> teardown_airflow_task
+
+    tasks_map[DBT_TEARDOWN_ASYNC_TASK_ID] = teardown_airflow_task
+
+
 def build_airflow_graph(
     nodes: dict[str, DbtNode],
     dag: DAG,  # Airflow-specific - parent DAG where to associate tasks and (optional) task groups
@@ -497,6 +542,7 @@ def build_airflow_graph(
     render_config: RenderConfig,
     task_group: TaskGroup | None = None,
     on_warning_callback: Callable[..., Any] | None = None,  # argument specific to the DBT test command
+    async_py_requirements: list[str] | None = None,
 ) -> dict[str, Union[TaskGroup, BaseOperator]]:
     """
     Instantiate dbt `nodes` as Airflow tasks within the given `task_group` (optional) or `dag` (mandatory).
@@ -594,7 +640,25 @@ def build_airflow_graph(
 
     create_airflow_task_dependencies(nodes, tasks_map)
     if enable_setup_async_task:
-        _add_dbt_setup_async_task(dag, execution_mode, task_args, tasks_map, task_group, render_config=render_config)
+        _add_dbt_setup_async_task(
+            dag,
+            execution_mode,
+            task_args,
+            tasks_map,
+            task_group,
+            render_config=render_config,
+            async_py_requirements=async_py_requirements,
+        )
+    if enable_teardown_async_task:
+        _add_teardown_task(
+            dag,
+            execution_mode,
+            task_args,
+            tasks_map,
+            task_group,
+            render_config=render_config,
+            async_py_requirements=async_py_requirements,
+        )
     return tasks_map
 
 

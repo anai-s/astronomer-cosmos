@@ -46,6 +46,13 @@ from cosmos.log import get_logger
 logger = get_logger(__name__)
 
 
+def _normalize_path(path: str) -> str:
+    """
+    Converts a potentially Windows path string into a Posix-friendly path.
+    """
+    return Path(path.replace("\\", "/")).as_posix()
+
+
 class CosmosLoadDbtException(Exception):
     """
     Exception raised while trying to load a `dbt` project as a `DbtGraph` instance.
@@ -64,6 +71,7 @@ class DbtNode:
     resource_type: DbtResourceType
     depends_on: list[str]
     file_path: Path
+    package_name: str | None = None
     tags: list[str] = field(default_factory=lambda: [])
     config: dict[str, Any] = field(default_factory=lambda: {})
     has_freshness: bool = False
@@ -279,12 +287,17 @@ def parse_dbt_ls_output(project_path: Path | None, ls_stdout: str) -> dict[str, 
         except json.decoder.JSONDecodeError:
             logger.debug("Skipped dbt ls line: %s", line)
         else:
+            base_path = (
+                project_path.parent / node_dict["package_name"] if node_dict.get("package_name") else project_path  # type: ignore
+            )
+
             try:
                 node = DbtNode(
                     unique_id=node_dict["unique_id"],
+                    package_name=node_dict.get("package_name"),
                     resource_type=DbtResourceType(node_dict["resource_type"]),
                     depends_on=node_dict.get("depends_on", {}).get("nodes", []),
-                    file_path=project_path / node_dict["original_file_path"],
+                    file_path=base_path / node_dict["original_file_path"],
                     tags=node_dict.get("tags", []),
                     config=node_dict.get("config", {}),
                     has_freshness=(
@@ -347,6 +360,9 @@ class DbtGraph:
         self.dbt_vars = dbt_vars or {}
         self.operator_args = operator_args or {}
         self.log_dir: Path | None = None
+        self.should_install_dbt_deps = (
+            self.render_config.dbt_deps if isinstance(self.render_config.dbt_deps, bool) else True
+        )
 
     @cached_property
     def env_vars(self) -> dict[str, str]:
@@ -373,8 +389,8 @@ class DbtGraph:
         """
         Change args list in-place so they include dbt vars, if they are set.
         """
-        if self.project.dbt_vars:
-            cmd_args.extend(["--vars", json.dumps(self.project.dbt_vars, sort_keys=True)])
+        if self.dbt_vars:
+            cmd_args.extend(["--vars", json.dumps(self.dbt_vars, sort_keys=True)])
 
     @cached_property
     def dbt_ls_args(self) -> list[str]:
@@ -527,7 +543,7 @@ class DbtGraph:
         self.update_node_dependency()
 
         logger.info("Total nodes: %i", len(self.nodes))
-        logger.info("Total filtered nodes: %i", len(self.nodes))
+        logger.info("Total filtered nodes: %i", len(self.filtered_nodes))
 
     def run_dbt_ls(
         self, dbt_cmd: str, project_path: Path, tmp_dir: Path, env_vars: dict[str, str]
@@ -642,7 +658,7 @@ class DbtGraph:
             logger.debug(f"Content of the dbt project dir {project_path}: `{os.listdir(project_path)}`")
             tmpdir_path = Path(tmpdir)
 
-            create_symlinks(project_path, tmpdir_path, self.render_config.dbt_deps)
+            create_symlinks(project_path, tmpdir_path, self.should_install_dbt_deps)
 
             latest_partial_parse = None
             if self.project.partial_parse:
@@ -679,7 +695,7 @@ class DbtGraph:
                 self.log_dir = Path(env.get(DBT_LOG_PATH_ENVVAR) or tmpdir_path / DBT_LOG_DIR_NAME)
                 env[DBT_LOG_PATH_ENVVAR] = str(self.log_dir)
 
-                if self.render_config.dbt_deps and has_non_empty_dependencies_file(self.project_path):
+                if self.should_install_dbt_deps and has_non_empty_dependencies_file(self.project_path):
                     if is_cache_package_lockfile_enabled(project_path):
                         latest_package_lockfile = _get_latest_cached_package_lockfile(project_path)
                         if latest_package_lockfile:
@@ -818,9 +834,10 @@ class DbtGraph:
             for unique_id, node_dict in resources.items():
                 node = DbtNode(
                     unique_id=unique_id,
+                    package_name=node_dict.get("package_name"),
                     resource_type=DbtResourceType(node_dict["resource_type"]),
                     depends_on=node_dict.get("depends_on", {}).get("nodes", []),
-                    file_path=self.execution_config.project_path / Path(node_dict["original_file_path"]),
+                    file_path=self.execution_config.project_path / _normalize_path(node_dict["original_file_path"]),
                     tags=node_dict["tags"],
                     config=node_dict["config"],
                     has_freshness=(
